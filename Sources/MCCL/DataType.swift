@@ -130,8 +130,36 @@ enum ElementIO {
 
 // MARK: - Reduction kernels
 
-/// Elementwise reductions. Scalar loops; the interconnect is the bottleneck on
-/// a Mac cluster, not this arithmetic, so vectorising is deferred.
+/// Lane count for the float reduction kernels — two 128-bit NEON registers per
+/// iteration, matching `CodecKernels`.
+private let reduceLanes = 8
+private typealias R8 = SIMD8<Float>
+
+/// Elementwise reductions: `dst = op(dst, src)`, and the `.avg` scale.
+///
+/// The ring folds one received chunk into the local buffer on every hop, so
+/// `reduce` runs `n-1` times per all-reduce over the whole payload. That is not
+/// free even when the cable is the bottleneck — at 1 GB/s over Thunderbolt a
+/// kernel running at 16 GB/s still spends ~6% of the wall clock, and over a
+/// fast fabric or in-process it is the whole cost.
+///
+/// The original loops were dtype-specialised on the *outside* but switched on
+/// `op` on the *inside*, once per element, via a shared `combine(_:_:_:)`. That
+/// is the same shape that cost the wire codecs an order of magnitude (see the
+/// note at the top of `CodecKernels.swift`): with a runtime value in the loop
+/// body the vectoriser has nothing to work with. Hoisting the `op` switch out
+/// of the loop — so each loop body is a single compile-time-known operation —
+/// is the entire fix.
+///
+/// Semantics are unchanged element for element, including the parts a vector
+/// rewrite most easily breaks:
+///
+///  * `Swift.min(x, y)` is `y < x ? y : x`, which is **not** symmetric in NaN.
+///    The masked selects below spell that out rather than using a hardware
+///    `fmin`, which is. `ReduceKernelTests` pins it.
+///  * fp16 and bf16 reduce through an fp32 intermediate and round once on
+///    store, as they always did — not in half precision.
+///  * the integer dtypes wrap (`&+`, `&*`); only `scale` saturates.
 enum Kernels {
     static func reduce(
         into dst: UnsafeMutableRawPointer,
@@ -146,60 +174,120 @@ enum Kernels {
         case .float32:
             let d = dst.bindMemory(to: Float.self, capacity: count)
             let s = src.bindMemory(to: Float.self, capacity: count)
-            for i in 0..<count { d[i] = combine(d[i], s[i], op) }
+            switch op {
+            case .sum, .avg: mapF32(d, s, count, { $0 + $1 }, { $0 + $1 })
+            case .prod: mapF32(d, s, count, { $0 * $1 }, { $0 * $1 })
+            // `b .< a ? b : a` — Swift.min's own definition, lane by lane.
+            case .min: mapF32(d, s, count, { $0.replacing(with: $1, where: $1 .< $0) },
+                              { Swift.min($0, $1) })
+            case .max: mapF32(d, s, count, { $0.replacing(with: $1, where: $1 .>= $0) },
+                              { Swift.max($0, $1) })
+            }
         case .float16:
             let d = dst.bindMemory(to: Float16.self, capacity: count)
             let s = src.bindMemory(to: Float16.self, capacity: count)
-            for i in 0..<count { d[i] = Float16(combine(Float(d[i]), Float(s[i]), op)) }
+            switch op {
+            case .sum, .avg: mapNarrow(d, s, count) { $0 + $1 }
+            case .prod: mapNarrow(d, s, count) { $0 * $1 }
+            case .min: mapNarrow(d, s, count) { Swift.min($0, $1) }
+            case .max: mapNarrow(d, s, count) { Swift.max($0, $1) }
+            }
         case .bfloat16:
             let d = dst.bindMemory(to: UInt16.self, capacity: count)
             let s = src.bindMemory(to: UInt16.self, capacity: count)
-            for i in 0..<count {
-                d[i] = BFloat16.fromFloat(combine(BFloat16.toFloat(d[i]), BFloat16.toFloat(s[i]), op))
+            switch op {
+            case .sum, .avg: mapBF16(d, s, count) { $0 + $1 }
+            case .prod: mapBF16(d, s, count) { $0 * $1 }
+            case .min: mapBF16(d, s, count) { Swift.min($0, $1) }
+            case .max: mapBF16(d, s, count) { Swift.max($0, $1) }
             }
         case .int32:
             let d = dst.bindMemory(to: Int32.self, capacity: count)
             let s = src.bindMemory(to: Int32.self, capacity: count)
-            for i in 0..<count { d[i] = combine(d[i], s[i], op) }
+            switch op {
+            case .sum, .avg: mapInteger(d, s, count) { $0 &+ $1 }
+            case .prod: mapInteger(d, s, count) { $0 &* $1 }
+            case .min: mapInteger(d, s, count) { Swift.min($0, $1) }
+            case .max: mapInteger(d, s, count) { Swift.max($0, $1) }
+            }
         case .int8:
             let d = dst.bindMemory(to: Int8.self, capacity: count)
             let s = src.bindMemory(to: Int8.self, capacity: count)
-            for i in 0..<count { d[i] = combine(d[i], s[i], op) }
+            switch op {
+            case .sum, .avg: mapInteger(d, s, count) { $0 &+ $1 }
+            case .prod: mapInteger(d, s, count) { $0 &* $1 }
+            case .min: mapInteger(d, s, count) { Swift.min($0, $1) }
+            case .max: mapInteger(d, s, count) { Swift.max($0, $1) }
+            }
         }
     }
 
+    /// fp32: explicit eight-lane body plus a scalar tail. Written out rather
+    /// than left to the auto-vectoriser because `min`/`max` need the exact
+    /// NaN-asymmetric select, which no `fmin` instruction gives.
     @inline(__always)
-    private static func combine(_ a: Float, _ b: Float, _ op: ReduceOp) -> Float {
-        switch op {
-        case .sum, .avg: return a + b
-        case .prod: return a * b
-        case .min: return Swift.min(a, b)
-        case .max: return Swift.max(a, b)
+    private static func mapF32(
+        _ d: UnsafeMutablePointer<Float>, _ s: UnsafePointer<Float>, _ count: Int,
+        _ vector: (R8, R8) -> R8, _ scalar: (Float, Float) -> Float
+    ) {
+        var i = 0
+        while i + reduceLanes <= count {
+            let a = UnsafeRawPointer(d + i).loadUnaligned(as: R8.self)
+            let b = UnsafeRawPointer(s + i).loadUnaligned(as: R8.self)
+            UnsafeMutableRawPointer(d + i).storeBytes(of: vector(a, b), as: R8.self)
+            i += reduceLanes
+        }
+        while i < count { d[i] = scalar(d[i], s[i]); i += 1 }
+    }
+
+    /// fp16: widen, combine in fp32, round once on store. A constant stride and
+    /// a constant operation are all the optimiser needs to emit the
+    /// `fcvtl`/`fcvtn` pair — hand-written SIMD is slower here, for the reason
+    /// recorded in `CodecKernels.swift`.
+    @inline(__always)
+    private static func mapNarrow(
+        _ d: UnsafeMutablePointer<Float16>, _ s: UnsafePointer<Float16>, _ count: Int,
+        _ combine: (Float, Float) -> Float
+    ) {
+        for i in 0..<count { d[i] = Float16(combine(Float(d[i]), Float(s[i]))) }
+    }
+
+    /// bf16 is carried as `UInt16`; the round-to-nearest-even store has a NaN
+    /// branch in it, so this stays a scalar loop — but a scalar loop over one
+    /// known operation, not a switch per element.
+    @inline(__always)
+    private static func mapBF16(
+        _ d: UnsafeMutablePointer<UInt16>, _ s: UnsafePointer<UInt16>, _ count: Int,
+        _ combine: (Float, Float) -> Float
+    ) {
+        for i in 0..<count {
+            d[i] = BFloat16.fromFloat(combine(BFloat16.toFloat(d[i]), BFloat16.toFloat(s[i])))
         }
     }
 
+    /// int32/int8. `SIMDScalar` integers auto-vectorise from a plain loop once
+    /// the operation is fixed; `Int8.min`/`max` and the wrapping operators all
+    /// have direct NEON forms.
     @inline(__always)
-    private static func combine(_ a: Int32, _ b: Int32, _ op: ReduceOp) -> Int32 {
-        switch op {
-        case .sum, .avg: return a &+ b
-        case .prod: return a &* b
-        case .min: return Swift.min(a, b)
-        case .max: return Swift.max(a, b)
-        }
-    }
-
-    @inline(__always)
-    private static func combine(_ a: Int8, _ b: Int8, _ op: ReduceOp) -> Int8 {
-        switch op {
-        case .sum, .avg: return a &+ b
-        case .prod: return a &* b
-        case .min: return Swift.min(a, b)
-        case .max: return Swift.max(a, b)
-        }
+    private static func mapInteger<T: FixedWidthInteger>(
+        _ d: UnsafeMutablePointer<T>, _ s: UnsafePointer<T>, _ count: Int,
+        _ combine: (T, T) -> T
+    ) {
+        for i in 0..<count { d[i] = combine(d[i], s[i]) }
     }
 
     /// Multiply every element by `factor`. Used to turn a summed all-reduce
     /// into `.avg` exactly once, at the end.
+    ///
+    /// The integer dtypes saturate rather than wrap: an averaged accumulator
+    /// that silently flipped sign would be worse than a clamped one.
+    ///
+    /// Left as plain loops on purpose. `scale` never had the per-element switch
+    /// — `factor` is hoisted to a local before the loop and each dtype gets its
+    /// own body — so it was already auto-vectorising. Measured, the fp32 path
+    /// runs at ~98 GB/s both before and after this rewrite, and replacing it
+    /// with hand-written SIMD changed nothing. It is documented here so the
+    /// next person does not "optimise" it again.
     static func scale(
         _ buffer: UnsafeMutableRawPointer,
         count: Int,

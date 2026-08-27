@@ -285,4 +285,28 @@ final class BenchmarkTests: XCTestCase {
         XCTAssertEqual(BenchTable.seconds(2.5e-3), "2.500 ms")
         XCTAssertEqual(BenchTable.seconds(1.25), "1.250 s")
     }
+    // MARK: - Inapplicable algorithms
+
+    /// A world with no hierarchy produces no hierarchical rows, and that has to
+    /// be *said*. An n=3 sweep asked for `hierarchical` and silently got a table
+    /// without it, which reads as a broken harness rather than as a property of
+    /// a uniform three-rank fabric.
+    func testHierarchicalReportsWhyItIsInapplicable() {
+        for worldSize in [1, 2, 3] {
+            XCTAssertNil(BenchAlgorithm.hierarchical.plan(worldSize: worldSize))
+            let reason = BenchAlgorithm.hierarchical.inapplicabilityReason(worldSize: worldSize)
+            XCTAssertNotNil(reason, "world of \(worldSize)")
+            XCTAssertTrue(reason?.contains("islands") ?? false, reason ?? "nil")
+            XCTAssertTrue(reason?.contains("\(worldSize)") ?? false, reason ?? "nil")
+        }
+    }
+
+    func testApplicableAlgorithmsGiveNoReason() {
+        for worldSize in [2, 3, 4, 8] {
+            XCTAssertNil(BenchAlgorithm.ring.inapplicabilityReason(worldSize: worldSize))
+            XCTAssertNil(BenchAlgorithm.tree.inapplicabilityReason(worldSize: worldSize))
+        }
+        XCTAssertNil(BenchAlgorithm.hierarchical.inapplicabilityReason(worldSize: 4))
+    }
+
 }

@@ -23,9 +23,9 @@ training framework.
 
 - **[docs/USAGE.md](docs/USAGE.md)** — the practical guide. Probe a cluster, bring
   a communicator up three different ways, run every collective, use every codec,
-  link from C, read `mcclbench` output. Every example in it was compiled and run
-  before it was written down. Ends with concrete starting points for the four
-  pieces that are not built yet.
+  link from C, train data-parallel with MLX, read `mcclbench` output. Every
+  example in it was compiled and run before it was written down. Ends with
+  concrete starting points for the three pieces that are not built yet.
 - **[docs/WHITEPAPER.md](docs/WHITEPAPER.md)** — the design argument and the
   measured evaluation: why the interconnect rather than compute is the
   constraint, the closed-form ring/tree crossover, ratio-gap island detection,
@@ -37,33 +37,75 @@ training framework.
 
 ## Status
 
-Milestones 1–4 are implemented and tested; milestone 5 is partial — the C shim
-and the benchmark harness are in, the MLX adapter is not.
+Milestones 1–4 are implemented and tested; milestone 5 is nearly complete — the C
+shim, the benchmark harness and the MLX adapter are all in, and the one piece
+still missing is blocked upstream rather than here.
 
-**232 tests, all passing**, at 90.56% region / 94.43% function / 97.05% line
-coverage. First real-hardware validation: two Mac Studio M1 Max
-machines on a direct Thunderbolt cable negotiated at 20 Gb/s probed at **1.06 GB/s
-and 167.8 µs**, with the Thunderbolt and Wi-Fi paths correctly classified from
-interface media.
+**273 tests, all passing** (239 for the core library, 34 for the MLX adapter, which
+lives in its own test target so that `MCCL`'s tests never acquire an MLX
+dependency). First real-hardware validation: two Mac Studio M1 Max machines on a
+direct Thunderbolt cable negotiated at 20 Gb/s probed at **1.06 GB/s and 167.8 µs**,
+with the Thunderbolt and Wi-Fi paths correctly classified from interface media.
+
+**Data-parallel training works, and is provably the same computation as training
+on one machine.** `MCCLMLX` lets an MLX program hand mccl an `MLXArray`;
+`mccltrain` trains an MLP data-parallel across the world, averaging gradients
+through one fused all-reduce. Its correctness proof is an equivalence rather than
+a tolerance: a 2-rank run on half-batches must follow the same loss trajectory as
+a single process on the combined batch. Over 200 steps in one process it does to
+**4.8e-07**, one unit in the last place of fp32; across the two lab machines over
+the Thunderbolt cable, to **3.6e-05** (9.7e-06 relative) — the residue being two
+different physical GPUs reducing matmuls in different orders.
+
+**And it is honestly slower than one machine, which is the useful part.** At batch
+256 two nodes run at 0.17–0.43× of one, because the gradient all-reduce dwarfs the
+compute; the codecs help where the rule says they should (`downcast` 1.25× once the
+payload is bandwidth-bound) and do not rescue it. The fix is not a bigger model —
+communication and compute both scale with parameter count — it is a bigger batch,
+which scales only compute. Measured on the large model, the crossover falls between
+batch 1,024 and 4,096, and by batch 16,384 the second machine earns **1.45×**. See
+[USAGE.md § Training with MLX](docs/USAGE.md#training-with-mlx).
+
+**The planner's central claim now has its first hardware evidence, at n = 3.**
+Three ranks (2× M1 Max + M1 Pro) over Wi-Fi: the tree wins where the collective is
+latency-bound (1.87× at 16 KiB, 1.58× at 64 KiB, 1.17× at 256 KiB) and the ring wins
+where it is bandwidth-bound (1.32× at 1 MiB, 1.26× at 16 MiB), with the switch falling
+between 256 KiB and 1 MiB. That is the qualitative claim the library is built on, and
+it holds. **The constant does not:** the closed-form crossover, fed this fabric's
+probed α and B, predicts ~75 KB — low by 4–13×, consistent with the model assuming a
+single bandwidth while Wi-Fi's effective bandwidth moves twentyfold across the sweep.
+Right shape, wrong constant.
+
+Two things are still untested: the **hierarchical** plan, which needs at least two
+islands of two ranks (n ≥ 4), and the mixed-speed fabric that island detection exists
+for. Note also that the earlier n = 2 result — ring beating tree by 1.72× — supports a
+narrower claim than it looks: at two ranks the ring degenerates to a single full-duplex
+point-to-point exchange, its best case, so that measurement says *the executor exploits
+full duplex*, not that topology selection works.
 
 Collective throughput is measured on that cable rather than only over loopback.
 `mcclbench` runs distributed (`--rank` / `--world-size`, joining through a rendezvous
 token), and a 2-node all-reduce reaches **0.746 GB/s bus bandwidth at 16 MiB — 70.4%
-of the probed link**. That sweep produced the rule the codecs are governed by — *a
-codec pays only when the fabric's uncompressed all-reduce rate is below the codec's
-own encode/decode ceiling* — and, with scalar encoders, a verdict against every
-codec on Thunderbolt.
+of the probed link**.
 
-**The codecs are now vectorised, and the Thunderbolt verdict has flipped for two of
-the three.** `CodecKernels` produces byte-for-byte the same frames (checked against
-the scalar loops in both directions, and re-verified at the interface counters), at
-8–12× the throughput for `downcast` and `int8`, 1.9× for top-k. Re-run on the same
-cable against a same-session scalar control, `downcast` went from 0.79–1.04× to
-**1.07–1.53×** against uncompressed and `int8/256` from 0.51–0.80× to
-**1.27–1.71×**, while `topk/0.01` — the one codec whose ceiling is still below what
-the cable delivers — stayed a loss, exactly as the rule requires. Over Wi-Fi the
-codecs now collect almost their full wire reduction (downcast 1.99× of a possible
-2.00×, int8 3.88× of 3.94×). See
+**The result that generalises is a rule, and it survived being tested from both
+sides.** *A codec pays only when the fabric's uncompressed all-reduce rate is below
+that codec's own encode/decode ceiling.* Both terms are measurable on the machine in
+front of you (`mcclbench` for the fabric, `mcclbench --codec-bench` for the ceiling),
+so the rule decides whether to switch compression on rather than deferring it to a
+benchmark. It is also falsifiable, and vectorising the codecs was the experiment that
+tested it: lift a ceiling from below the fabric's rate to above it and that codec must
+flip to a win; leave one below and it must keep losing.
+
+Both halves held. `downcast` went from 0.79–1.04× to **1.07–1.53×** against
+uncompressed on the same cable, and `int8/256` from 0.51–0.80× to **1.27–1.71×** —
+while `topk/0.01`, whose ceiling rose 1.9× and is *still* below what the cable
+delivers, stayed a loss. The kernel speedups behind that (8–12× for `downcast` and
+`int8`, 1.9× for top-k, `CodecKernels` producing byte-for-byte the same frames as the
+scalar loops, checked in both directions and re-verified at the interface counters)
+are the instrument, not the finding. Over Wi-Fi every codec wins either way and now
+collects almost its full wire reduction (downcast 1.99× of a possible 2.00×, int8
+3.88× of 3.94×). See
 [ARCHITECTURE.md § Measured: vectorised codecs](docs/ARCHITECTURE.md#measured-vectorised-codecs)
 for the tables, the method, and the ceilings measured per chip.
 
@@ -104,9 +146,31 @@ for the tables, the method, and the ceilings measured per chip.
   the ranks and the sockets and measures the codec kernels alone, which is the
   local half of deciding whether compression is worth switching on.
 
+- **MLX adapter.** `MCCLMLX` — a separate target and product, so that `MCCL` itself
+  stays dependency-free — extends `Communicator` with `allReduce`/`allGather`/
+  `broadcast`/`reduce`/`reduceScatter` over `MLXArray`, plus `averageGradients`,
+  which flattens a model's gradients into one buffer and all-reduces them once.
+  Ten separate all-reduces would spend 1.7 ms on round trips alone at MLP scale;
+  fusing spends one. `mccltrain` is the demo, and the loss-trajectory equivalence
+  above is its proof.
+- **Reduction kernels.** `Kernels.reduce` had the same runtime-switch-in-the-loop
+  pattern that cost the codecs an order of magnitude, and the same fix applied:
+  4.4–5.1× on fp32, 21× on int8. `Kernels.scale` turned out to have been
+  auto-vectorising all along and was left alone — measured, and recorded in the
+  source so it does not get "optimised" again.
+
 **Not yet**
 
-- The MLX adapter, and comparative numbers against MLX's built-in ring.
+- **A same-language head-to-head against MLX's built-in ring.** Blocked upstream:
+  mlx-swift does not build MLX's distributed backends at all (its `Package.swift`
+  excludes `mlx/distributed/{ring,mpi,nccl,jaccl}`) and exposes no distributed
+  API. Python MLX does ship the ring, so a cross-language measurement over the
+  same cable is possible — it compares two runtimes rather than two schedulers.
+- **The hierarchical plan on real hardware**, which needs four machines with two
+  fast islands. n = 3 validated ring-versus-tree selection; nothing has yet exercised
+  island detection, and nothing has tested the planner on a mixed-speed fabric.
+- **A crossover constant that matches measurement.** The closed form has the right
+  shape and is 4–13× low on Wi-Fi, because it assumes one bandwidth.
 - Thunderbolt-specific transport (bulk DMA rather than IP-over-TB).
 - A rendezvous *service*. `Rendezvous` closes the gap the C ABI needs — one round
   trip through rank 0 — but there is no discovery, no membership change, and no
@@ -124,8 +188,25 @@ swift build
 swift test
 ```
 
-No external package dependencies. Use `swift build` / `swift test` only —
-`xcodebuild` is not supported here.
+`MCCL` has no external package dependencies. One target does, and is kept apart on
+purpose: `MCCLMLX` (and the `mccltrain` demo built on it) depends on `mlx-swift`.
+Nothing else in the package can see it — depend on `MCCL` and you get the same
+dependency-free library.
+
+Use `swift build` / `swift test` only — `xcodebuild` is not supported here.
+
+**Anything touching MLX needs one more step**, including `swift test`:
+
+```
+Tools/fetch-metallib.sh
+```
+
+mlx-swift compiles MLX's C++ core under SwiftPM but does not build `mlx.metallib`
+— that is Xcode's build system, which this project does not use. Without it MLX
+aborts on its first GPU operation. The script fetches the version-matched shader
+library from the `mlx-metal` pip wheel and installs it beside the built binaries.
+Tests that need it skip with this instruction if it is absent; the core library's
+239 tests never load MLX at all.
 
 ## Using the probe
 
@@ -214,6 +295,38 @@ context, which is what top-k's per-stream residual needs.
 `Tests/MCCLTests/CProgram/mccl_smoke.c` is a complete working client, and
 [USAGE.md § Using the C API](docs/USAGE.md#using-the-c-api) has a smaller one with
 the exact `cc` line.
+
+## Data-parallel training with MLX
+
+```swift
+import MCCL
+import MCCLMLX
+import MLXNN
+
+let (loss, grads) = valueAndGrad(model: model, lossFunction)(model, x, y)
+eval(loss, grads)                                     // mccl reduces bytes, not graphs
+
+let averaged = try averageGradients(grads, comm: comm) // one fused all-reduce, .avg
+SGD.step(model: model, gradients: averaged, learningRate: lr)
+```
+
+`averageGradients` flattens the whole gradient tree into one contiguous buffer with
+a rank-independent layout (sorted parameter paths, fixed dtype order), all-reduces it
+once, and slices it back. One all-reduce per tensor would spend a 167.8 µs round trip
+each — 1.7 ms for a ten-tensor model, more than the backward pass itself.
+
+Individual collectives are there too, as an extension on `Communicator`:
+
+```swift
+let summed = try comm.allReduce(gradient, op: .sum, compression: .downcast)
+let all    = try comm.allGather(gradient)     // [worldSize] + gradient.shape
+```
+
+`mccltrain` is the working demo — `--verify` proves a 2-rank run is the same
+computation as a single-process one, and `--rank`/`--token` runs it across machines.
+Full guide, including the copy accounting and the metallib step:
+[USAGE.md § Training with MLX](docs/USAGE.md#training-with-mlx).
+
 
 ## Benchmarking
 

@@ -191,6 +191,110 @@ compiles it with `cc` against the built dylib and runs it, which is the only che
 proves at once that the header is valid C, that its declarations match the exported
 symbols, and that a non-Swift process can link the library.
 
+## MLX adapter
+
+`MCCLMLX` is a separate target and a separate product, and that separation is the design
+decision, not an incidental one. It is the only thing in the package with an external
+dependency (`mlx-swift`); `MCCL` must stay linkable by a runtime that has never heard of
+MLX, so the arrow points one way and only one way. `MCCLMLX` depends on `MCCL`; nothing
+in `MCCL` knows the adapter exists. The C shim is the model in every other respect too:
+thin, no decisions, every rule stated once in `MCCL` and surfaced here as an error.
+
+The surface is an extension on `Communicator` taking `MLXArray`s — `allReduce`,
+`allGather`, `broadcast`, `reduce`, `reduceScatter` — plus `averageGradients`, which is
+the thing a training loop actually wants. All of it is synchronous: MLX's own
+`all_sum` is, and an MLX training loop is straight-line code, so the adapter parks on a
+semaphore over the async Swift API exactly as `CABI.swift` does.
+
+### The three things the adapter has to arrange
+
+**Laziness.** An `MLXArray` is a graph node until something forces it; mccl reduces
+bytes. Every entry point calls `eval()` first. This is also why a data-parallel step
+cannot be one compiled MLX graph — the backward pass must be *finished* before the
+network call starts, so the step is cut in two around the collective.
+
+**Layout.** A strided or broadcast array has no single contiguous run of bytes to send.
+`asData(access: .noCopyIfContiguous)` returns the backing when the layout allows and
+materialises a contiguous copy when it does not. In practice the fallback almost never
+fires: MLX's own `eval()` has already materialised a strided slice into a fresh
+contiguous array by the time the adapter looks.
+
+**Aliasing.** MLX arrays share backings freely, so reducing in place over a caller's
+array would corrupt every array that happened to alias it. The adapter returns a new
+array and pays a copy for it.
+
+### Zero-copy: what is real and what is not
+
+The property that matters is free. MLX allocates in unified memory, so the pointer
+handed to mccl is the address the GPU reads — there is no host/device staging anywhere.
+A CUDA equivalent would `cudaMemcpy` every payload to host memory and back before NCCL
+could see it. That is a platform advantage, not a clever one, and it is the whole reason
+this is an adapter rather than a copy layer.
+
+Writing a result *into* an `MLXArray` is where it gets interesting, and the finding is
+worth recording because it is not documented anywhere:
+
+- mlx-swift's only public route to an array's bytes is `asData(access:)`, which returns
+  a Foundation `Data`. `Cmlx` — where `mlx_array_data_uint8` lives — is not a public
+  product of the package, so there is no supported mutable-pointer accessor at all.
+- `Data(bytesNoCopy:count:deallocator:)`, which `.noCopy` builds, **is not no-copy for
+  small buffers**. Foundation stores payloads of 14 bytes or fewer inline, copying them;
+  `withUnsafeBytes` then returns the address of that temporary and writes through it are
+  silently lost. Measured at the boundary: 14 bytes copies, 15 bytes aliases. A bias
+  vector of three floats is 12 bytes, so this is not an edge case — it is the case that
+  would have made small tensors reduce to a no-op with no error raised anywhere.
+
+`MLXWorkingBuffer` therefore has two backings, chosen by payload size, both correct:
+at or above 64 bytes mccl writes the result array's own storage (one copy in, none out);
+below it, mccl writes a scratch buffer the adapter owns and `finish()` builds the array
+from it (two copies). The threshold sits four times clear of Foundation's 14, and
+`MLXCollectiveTests.testAllReduceAcrossTheAdoptionThreshold` sweeps element counts across
+it, so it is an implementation detail rather than a behaviour — a Foundation change
+surfaces as a failing test, not a wrong answer. `allGather` and `reduceScatter` copy
+nothing at either size: mccl gives them separate send and receive buffers.
+
+**Is the remaining copy worth removing?** No. A memcpy runs at ~100 GB/s here — the rate
+`Kernels.scale` achieves — against a fabric that delivers 1.06 GB/s, so one copy costs
+about 1% of the time that payload spends on the cable. Removing it would buy a rounding
+error and cost the guarantee that passing an aliased array is safe.
+
+### Gradient averaging is one collective, not N
+
+`averageGradients` flattens a model's gradient tree into a single contiguous buffer,
+all-reduces it once with `.avg`, and slices the result back into the original shapes.
+
+The reason is latency, and the numbers are stark at MLP scale. One all-reduce over the
+Thunderbolt cable costs at least one round trip — 167.8 µs measured — before any payload
+moves. Ten separate all-reduces for a ten-tensor model spend 1.7 ms on latency alone,
+more than the entire backward pass. Fusing gives one round trip and hands the ring a
+message large enough to reach its bandwidth plateau. This is what `ncclGroupStart` exists
+for, and mccl reaches the same place without a batching primitive because the adapter
+knows the whole gradient set at once.
+
+Two invariants make it safe. Parameter paths are **sorted** and dtype groups are taken in
+a **fixed canonical order**, so the buffer layout is a function of the model's structure
+alone — the one thing every rank is guaranteed to agree on. Getting this wrong would not
+raise an error; the byte counts would still match and the ranks would average unrelated
+numbers. And `.topK` keeps one residual per dtype group, so a single-dtype model — the
+normal case — gets exactly one residual covering the whole flattened gradient and
+accumulates it correctly across a run.
+
+### The metallib, and why it is a build step
+
+mlx-swift compiles MLX's C++ core under SwiftPM but does not build `mlx.metallib`; that
+is Xcode's build system, which this project does not use and the lab nodes do not have.
+Without it MLX links and starts and then *aborts* on the first GPU op, so it cannot be
+caught and reported. `Tools/fetch-metallib.sh` takes the version-matched library out of
+the `mlx-metal` pip wheel and installs it beside the running binary, where MLX's loader
+(`dladdr` on one of its own symbols) looks. The technique is adapted from SwiftSci, which
+hit this first.
+
+Two consequences for the test suite. `MCCLMLXTests` is a **separate test target** so that
+the core library's 239 tests never acquire an MLX dependency and keep running on a
+machine with no metallib. And every test that touches MLX checks for the library first and skips
+with the fix, because a fatal error cannot be turned into a test failure.
+
+
 ## Rendezvous
 
 `Communicator.bootstrap` takes explicit addresses and has no opinion about how a cluster
@@ -397,8 +501,16 @@ same schedule, and the difference is measurable (best of four paired runs):
 The ring's reduce-scatter and all-gather each move `N/2` in *both* directions at once,
 so it uses the link full-duplex. The binomial tree sends `N` up to the root, reduces,
 then sends `N` back down — strictly serialised, half-duplex, and 1.7× slower at 16 MiB.
-The planner already prefers the ring for large messages on this topology; this is the
-measurement that says it is right to, even at n = 2.
+
+**What this does and does not establish.** It is a real correction to the naive
+expectation that the two plans tie at n = 2, and it says the executor genuinely exploits
+full duplex rather than merely claiming to. It says nothing about whether the *planner*
+picks well. At n = 2 the ring is not really a ring: it degenerates to a single
+full-duplex point-to-point exchange, which is the ring's best case by construction, and
+the result is close to definitional once you look at the schedules. The claim it supports
+is "the executor exploits full duplex", not "topology selection is validated" — a
+distinction that mattered until the n = 3 run below, which is where selection actually
+gets tested.
 
 **Noise.** `lab-01` is a shared machine and was running an unrelated inference workload
 (~40% of one core) throughout. Worst-case points ran up to 5× the best in the same
@@ -408,6 +520,22 @@ sensitive to the choice: `none` beats every codec above 256 KiB on Thunderbolt i
 the best-of and the median-of statistic, and loses to every codec on Wi-Fi in both.
 
 ## Measured: vectorised codecs
+
+The result of this section is a rule, not a speedup:
+
+> **A codec pays only when the fabric's uncompressed all-reduce rate is below that
+> codec's own encode/decode ceiling.**
+>
+> Both quantities are measurable on the machine in front of you — the fabric's rate with
+> `mcclbench`, the codec's ceiling with `mcclbench --codec-bench` — so the rule decides
+> the question rather than deferring it to a benchmark of your own workload.
+
+The rule is what makes compression a decision instead of a guess, it is stated in terms
+that hold for any fabric and any codec, and it is falsifiable: it predicts that lifting a
+codec's ceiling from below the fabric's rate to above it must flip that codec from a loss
+to a win, and that a codec whose ceiling stays below must keep losing. Everything below
+is the experiment that tested that prediction and the tables it produced. The kernel
+speedups are the *instrument*, not the finding.
 
 Same two machines, same cable, same sweep, later the same day. The change under test
 is `CodecKernels`: the encoders now run as vector code, byte-compatible with the
@@ -555,6 +683,132 @@ Every codec still wins, and now wins by almost exactly its wire reduction: `down
 already free, but scalar int8 was not, and vectorising is what turned its 3.94× of
 saved bytes into 3.88× of saved time.
 
+## Measured: n = 3, and the first test of the planner
+
+Everything above is n = 2, where the ring degenerates to a point-to-point exchange and
+the tree has nothing to be a tree about. The claim the library is built on — *pick the
+algorithm from measured bandwidth and latency, and the crossover follows* — needs at
+least three ranks before it says anything at all.
+
+Three ranks, two Mac Studio M1 Max plus an M1 Pro, over Wi-Fi (the only fabric that
+reaches all three), fp32 sum all-reduce, ring against tree at each size:
+
+| size | ring | tree | winner |
+|---|---|---|---|
+| 16 KiB | 25.619 ms | **13.697 ms** | tree, 1.87× |
+| 64 KiB | 28.982 ms | **18.334 ms** | tree, 1.58× |
+| 256 KiB | 35.334 ms | **30.143 ms** | tree, 1.17× |
+| 1 MiB | **76.165 ms** | 100.356 ms | ring, 1.32× |
+| 4 MiB | **329.019 ms** | 338.961 ms | ring, 1.03× |
+| 16 MiB | **1.078 s** | 1.357 s | ring, 1.26× |
+
+**The qualitative claim holds, and this is the first evidence for it on hardware.** The
+tree wins at small sizes, where the collective is latency-bound and `⌈log₂ n⌉` dependent
+hops beat `2(n−1)`; the ring wins at large sizes, where it is bandwidth-bound and the
+ring's `2(n−1)/n` bytes per link beat the tree's `2N` through the root. The crossing is
+monotone — tree's margin decays 1.87× → 1.58× → 1.17× as the size grows, then flips —
+which is the shape the model predicts, not merely a pair of endpoints that happen to
+differ. The measured switch falls between 256 KiB and 1 MiB.
+
+**The constant is wrong, and by a lot.** The closed-form crossover
+`S* = α·B·(log₂n − (n−1)) / ((n−1)/n − log₂n)`, fed the probed α and B for this Wi-Fi
+fabric, predicts ~75 KB. The measured crossover is somewhere in 256 KiB – 1 MiB, so the
+formula is low by a factor of roughly 4–13. The likely reason is visible in the table
+itself: the model assumes a single bandwidth `B`, and Wi-Fi's effective bandwidth is
+strongly size-dependent — the bus figures climb from 0.001 GB/s at 16 KiB to 0.021 GB/s
+at 16 MiB, a twentyfold change across the sweep. A crossover derived from one `B` cannot
+be right at both ends of that. So: **right shape, wrong constant**, and the honest
+summary is that the planner picks the correct algorithm on either side of a crossover it
+locates in the wrong place.
+
+**What is still unvalidated.** The hierarchical plan, which needs at least two islands of
+two ranks and therefore n ≥ 4 — a uniform three-rank fabric has no islands, and the
+sweep correctly produced no hierarchical rows for it. And this run is Wi-Fi, not
+Thunderbolt: the interesting mixed-speed case, where island detection is supposed to
+earn its place, is a four-machine fabric with both.
+
+### Two operational notes from that run
+
+**`mcclbench` used to drop inapplicable algorithms silently.** Asking a three-rank sweep
+for `hierarchical` produced a table with no hierarchical rows and no explanation, which
+reads as a broken harness rather than as a property of the world. Dropping the rows is
+correct; saying nothing was not. It now prints
+
+```
+hierarchical: not applicable — needs at least two islands of two ranks; a 3-rank uniform fabric has none
+```
+
+before the table (`BenchAlgorithm.inapplicabilityReason(worldSize:)`).
+
+**Detached ssh sessions break outbound dials on macOS 26.** This cost an hour of
+diagnosis and will bite anyone orchestrating a multi-node run, so it is written up in
+full at [USAGE.md § Launching across machines: keep the ssh session
+attached](USAGE.md#launching-across-machines-keep-the-ssh-session-attached). The short
+version: a `nohup`-detached mccl process whose ssh session has since exited gets
+`No route to host` (EHOSTUNREACH) on every outbound LAN dial, while its *accepts* keep
+working — so rank 0 always came up and every joining rank always failed. It is macOS's
+local-network privacy control, which blocks orphaned non-platform binaries' unicast
+dials. Keep the ssh session attached, or launch under launchd.
+
+
+## Measured: reduction kernels
+
+The codec work left a loose end. Its finding was not "SIMD is faster" but something more
+specific and more portable: **a loop whose body switches on a runtime value cannot be
+vectorised, and on this code that was worth an order of magnitude.** `WireCodec.encode`
+walked its buffer with a stride read from the dtype and called `ElementIO.loadFloat`,
+which switched on that dtype once per element. Neither the stride nor the element type
+was a compile-time constant inside the loop.
+
+`Kernels.reduce` had the same shape from the other direction. It was dtype-specialised on
+the *outside* — a `switch dataType` selecting a typed loop — but every iteration called a
+shared `combine(_:_:_:)` that switched on `op`. One runtime value in the loop body is
+enough.
+
+The fix is not SIMD; it is hoisting. Each `(dtype, op)` pair now gets a loop body that is
+a single compile-time-known operation. fp32 is written as an explicit eight-lane body
+because `min`/`max` need an exact NaN-asymmetric select that no hardware `fmin` provides
+(`Swift.min(x, y)` is `y < x ? y : x`, which is not symmetric in NaN); the rest are plain
+loops that the optimiser vectorises once the operation is fixed.
+
+Measured on an M1 Pro, release build, 4 Mi elements, best of seven with the buffers
+re-seeded before each timed pass. Rates count both streams read and the stream written:
+
+| kernel | before | after | speedup |
+|---|---|---|---|
+| `reduce` fp32 sum | 16.88 GB/s | **75.54 GB/s** | 4.5× |
+| `reduce` fp32 prod | 16.55 GB/s | **83.69 GB/s** | 5.1× |
+| `reduce` fp32 min | 16.63 GB/s | **73.22 GB/s** | 4.4× |
+| `reduce` fp32 max | 16.13 GB/s | **82.84 GB/s** | 5.1× |
+| `reduce` fp16 sum | 7.36 GB/s | **93.54 GB/s** | 12.7× |
+| `reduce` bf16 sum | 3.85 GB/s | **20.13 GB/s** | 5.2× |
+| `reduce` int32 sum | 14.76 GB/s | **82.13 GB/s** | 5.6× |
+| `reduce` int8 sum | 4.33 GB/s | **92.29 GB/s** | 21.3× |
+| `scale` fp32 | 98.18 GB/s | 97.14 GB/s | 1.00× |
+
+**`scale` was already fine, and that is the honest half of the result.** It never had the
+per-element switch — the factor is hoisted to a local and each dtype has its own body —
+so it was already auto-vectorising, and replacing it with hand-written SIMD changed
+nothing measurable. It was reverted to the plain loop and the measurement written into
+the source, so the next reader does not "optimise" it again. bf16 is the other honest
+exception: its round-to-nearest-even store has a NaN branch in it, so it stays scalar and
+gains only from the hoist.
+
+**What this is worth in a collective.** Less than the codec numbers were, and the reason
+is structural: reduction runs once per received chunk while a codec runs twice per call,
+and `none` was never codec-bound. On the 1.06 GB/s Thunderbolt cable a 16.9 GB/s kernel
+already spends only ~6% of the wall clock. The cases where it matters are the ones where
+the fabric is not the bottleneck — in-process and loopback worlds, a future bulk-DMA
+transport, and the reduction that top-k's gathered blocks feed.
+
+Semantics did not move. `ReduceKernelTests` pins every `(dtype, op)` pair element-for-element
+against an independently written reference, including the fp16/bf16 rounding, the integer
+wrapping, `scale`'s integer saturation, and the NaN asymmetry of `min`/`max`. The
+throughput test is release-only and skips in debug — an unoptimised build runs these
+loops about a thousand times slower (1.15 GB/s against 75), so a debug run would measure
+the absence of the optimiser rather than the kernel.
+
+
 ## Milestones
 
 - [x] **1. Probe:** pairwise bandwidth/latency measurement + persisted topology map.
@@ -577,14 +831,26 @@ saved bytes into 3.88× of saved time.
       The C shim ships (`mccl.h`, `libmccl.dylib`, validated by a compiled C client) and
       `mcclbench` compares every algorithm against every codec across message sizes,
       now in-process *or* across machines (`--rank` / `--world-size`) — see
-      §Measured for the first real 2-node Thunderbolt numbers. The MLX adapter and the
-      head-to-head against MLX's ring are what remain.
+      §Measured for the real 2-node Thunderbolt numbers. **The MLX adapter ships**
+      (`MCCLMLX`, §MLX adapter) with a working data-parallel training demo
+      (`mccltrain`) whose 2-rank loss trajectory matches a single-process run on the
+      combined batch to 4.8e-07. The head-to-head against MLX's *own* ring is the one
+      part still open, and for a reason outside mccl: mlx-swift does not build MLX's
+      distributed backends at all (its `Package.swift` excludes
+      `mlx/distributed/{ring,mpi,nccl,jaccl}`) and exposes no distributed API, so a
+      Swift-against-Swift comparison cannot be built from this package.
 
 ### Not yet built
 
-- **MLX adapter**, and head-to-head numbers against MLX's built-in ring. `mcclbench`
-  is the harness that will produce them; what is missing is the shim that lets MLX
-  hand mccl its arrays, and a cluster to run it on.
+- **A same-language head-to-head against MLX's built-in ring.** Blocked upstream, not
+  here: mlx-swift ships no distributed support. Python MLX does, so a cross-language
+  measurement over the same cable is possible and is recorded in COMPARISON.md, but it
+  compares two runtimes rather than two schedulers.
+- **A 3+ node run.** Everything measured so far is n = 2, where the ring degenerates to
+  a single full-duplex exchange and neither the tree's `O(log n)` hops nor the
+  hierarchical plan's single bridge crossing can pay. **Topology selection — the
+  planner, which is the library's main claim — is therefore unvalidated on hardware.**
+  This is the most valuable measurement still outstanding.
 - **Thunderbolt-specific transport.** The `Transport` protocol is the seam: a bulk-DMA
   TB transport implements `listen`/`connect` and everything above it is unchanged.
   Today TB is reached as ordinary IP over the Thunderbolt bridge.
@@ -594,13 +860,9 @@ saved bytes into 3.88× of saved time.
 - **Non-blocking C calls.** The shim runs every collective to completion. A genuine
   `mcclStream_t` execution context, with `mcclGroupStart`/`mcclGroupEnd` batching,
   waits on there being a device queue worth enqueueing onto.
-- **Vectorised reduction kernels.** The *codecs* are vectorised (`CodecKernels`, see
-  §Measured: vectorised codecs — `downcast` 8.7–12×, `int8/256` 8–10×, `topk` 1.9×,
-  and the Thunderbolt verdict flipped for the first two). `Kernels.reduce` and
-  `Kernels.scale` are still scalar loops. They are not the bottleneck the codecs were
-  — reduction runs once per received chunk against the codec's twice per call, and it
-  is already the cheapest term in `none`'s 30+ GB/s round trip — but the same runtime
-  stride and per-element dtype switch are in them, and the same fix applies.
+- ~~**Vectorised reduction kernels.**~~ Done — see §Measured: reduction kernels. The
+  same per-element-switch pattern was in `Kernels.reduce`, and the same fix applied:
+  4.4–5.1× on fp32, up to 21× on int8. `Kernels.scale` needed nothing and got nothing.
 - **Codec choice is still a caller's flag.** Now that two codecs win on Thunderbolt
   and one loses, `compression:` is a decision the planner has the data to make and
   the caller usually does not. The pieces exist: the probe measures the fabric, and

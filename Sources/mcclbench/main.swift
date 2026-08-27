@@ -61,6 +61,17 @@ if !options.csv, isReporter {
               + "\(options.transport.rawValue), \(options.dataType), op \(options.op)")
         print("host: \(identity.hostname), \(identity.chip)")
     }
+    // An algorithm with no plan for this world contributes no rows. Say so,
+    // rather than leaving the reader to wonder why the table is missing the
+    // shape they asked for.
+    if !options.codecBench {
+        let ranks = distributed?.worldSize ?? options.worldSize
+        for algorithm in options.algorithms {
+            if let reason = algorithm.inapplicabilityReason(worldSize: ranks) {
+                print("\(algorithm.rawValue): not applicable — \(reason)")
+            }
+        }
+    }
     print("")
 }
 

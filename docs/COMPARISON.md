@@ -36,17 +36,28 @@ carries — the fraction mccl's own scheduling controls — the collective extra
 
 ## The compression comparison NCCL cannot enter
 
-NCCL has no in-band lossy compression. mccl does, with exact wire-byte accounting
-(verified on interface counters: downcast 2.00×, int8 3.94×, topK/0.01 49.9× fewer
-bytes), and the measured rule for when it pays:
+NCCL has no in-band lossy compression, so this is the one axis on which there is nothing
+to compare against — and it is where mccl's most portable result lives. The result is not
+a speedup; it is a rule:
 
-**A codec pays only when the fabric's uncompressed all-reduce rate is below the codec's
-own encode/decode ceiling.**
+> **A codec pays only when the fabric's uncompressed all-reduce rate is below that
+> codec's own encode/decode ceiling.**
+
+Both quantities are measurable on the machine in front of you — the fabric's rate with
+`mcclbench`, the codec's ceiling with `mcclbench --codec-bench` — so the rule settles
+whether to switch compression on, rather than deferring it to a benchmark of your own
+workload. It is stated in terms that do not mention Thunderbolt, Apple silicon, or any
+particular codec, and it is falsifiable in both directions: lift a codec's ceiling from
+below the fabric's rate to above it and that codec must flip from a loss to a win; leave
+a codec's ceiling below and it must keep losing however much faster it got.
+
+mccl also has exact wire-byte accounting to hold the rule to (verified on interface
+counters: downcast 2.00×, int8 3.94×, topK/0.01 49.9× fewer bytes).
 
 The rule was stated from the scalar encoders, whose ceilings all sat below what the
-cable delivers, so every codec lost on Thunderbolt and every codec won on Wi-Fi. That
-made a falsifiable prediction — lift the ceilings and the Thunderbolt verdict should
-flip — and vectorising the encoders tested it. Ceilings are round-trip payload GB/s,
+cable delivers, so every codec lost on Thunderbolt and every codec won on Wi-Fi.
+Vectorising the encoders was the experiment that tested the prediction. The tables below
+are that experiment's evidence, not the claim. Ceilings are round-trip payload GB/s,
 measured directly with `mcclbench --codec-bench` on the rank that gates the
 collective:
 
@@ -73,8 +84,64 @@ scalar kernels on an *idle* M1 Max run at 3.67 GB/s for downcast; the low figure
 belong to the shared node that gates the collective. The rule survived the
 correction, the numbers attached to it did not.
 
-Also measured against naive theory: at n=2 the ring beats the tree by up to 1.72× —
-same bytes, but the ring is full-duplex while the tree serializes through the root.
+## Against naive theory, at n=2 and n=3
+
+At n=2 the ring beats the tree by up to 1.72× — same bytes, but the ring is full-duplex
+while the tree serializes through the root. Read this narrowly. At n=2 the ring
+degenerates to a single full-duplex point-to-point exchange, its best case, and the
+result is near-definitional once the two schedules are written out. It corrects the
+naive expectation that the two tie, and it shows the executor really does use the link
+in both directions at once. It is **not** evidence that topology *selection* works,
+because the plans that justify having a planner cannot pay at two ranks.
+
+**At n=3 selection was tested, and the qualitative claim holds.** Three ranks (2× M1
+Max + M1 Pro) over Wi-Fi, fp32 sum all-reduce, ring against tree at each size:
+
+| size | winner | margin |
+|---|---|---|
+| 16 KiB | tree | 1.87× |
+| 64 KiB | tree | 1.58× |
+| 256 KiB | tree | 1.17× |
+| 1 MiB | ring | 1.32× |
+| 4 MiB | ring | 1.03× |
+| 16 MiB | ring | 1.26× |
+
+Tree wins where the collective is latency-bound, ring wins where it is bandwidth-bound,
+and the tree's margin decays monotonically before it flips — the shape the model
+predicts, not two endpoints that happen to differ.
+
+**The constant is wrong by 4–13×.** The closed-form `S*`, fed the probed α and B for
+this fabric, predicts ~75 KB; the measured crossover is between 256 KiB and 1 MiB. The
+model assumes a single bandwidth `B`, and Wi-Fi's effective bandwidth moves twentyfold
+across this sweep (0.001 → 0.021 GB/s bus). Right shape, wrong constant: the planner
+picks correctly on either side of a crossover it locates in the wrong place.
+
+Still untested: the hierarchical plan, which needs at least two islands of two ranks and
+so n ≥ 4, and the mixed-speed fabric island detection exists for.
 
 Full tables and method notes: [ARCHITECTURE.md](ARCHITECTURE.md) §Measured,
 [WHITEPAPER.md](WHITEPAPER.md) §5.
+
+
+## The comparison that cannot be run
+
+The obvious head-to-head — mccl's ring against MLX's own ring, same workload, same cable
+— is not currently buildable, and the obstacle is upstream rather than here.
+**mlx-swift does not build MLX's distributed backends at all**: its `Package.swift`
+excludes `mlx/distributed/{ring,mpi,nccl,jaccl}` with the comment "do not build
+distributed support (yet)", and the Swift layer exposes no distributed API to call. This
+is not a metallib problem or a lab-machine problem; there is nothing to link against.
+
+Python MLX (0.29.3 on these nodes) *does* ship the ring backend, so a cross-language
+measurement over the same Thunderbolt pair is possible in principle, and a benchmark
+matching `mcclbench`'s definitions was written for it. It was not completed: MLX's
+launcher (`python3 -m mlx.distributed_run --backend ring`) requires passwordless ssh
+*between* the nodes, and these two have ssh trust only from the driving workstation, not
+to each other. Establishing that trust is a change to the lab machines rather than a
+measurement, so it was left alone.
+
+Two caveats to record for whoever finishes it. Such a number compares two language
+runtimes as much as two schedulers, so it belongs in the "sanity check on the fabric"
+column rather than the verdict column. And a genuine same-language comparison needs
+mlx-swift to expose `mlx::distributed`, or a build of mlx-swift with those sources put
+back in — that, not lab access, is the real blocker.

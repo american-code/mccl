@@ -18,6 +18,18 @@ let package = Package(
         // Algorithm/codec benchmark harness. The tool that will later measure
         // mccl against MLX's built-in ring on the real cluster.
         .executable(name: "mcclbench", targets: ["mcclbench"]),
+        // MLX adapter. Separate product, separate target, because it is the
+        // only thing in the package with an external dependency — linking
+        // MCCL must never drag mlx-swift in behind it.
+        .library(name: "MCCLMLX", targets: ["MCCLMLX"]),
+        // Data-parallel training demo driven by the adapter. Buildable without
+        // XCTest, because the lab nodes do not have it.
+        .executable(name: "mccltrain", targets: ["mccltrain"]),
+    ],
+    dependencies: [
+        // The MLX adapter's only dependency, and the package's only dependency
+        // full stop. Reached exclusively from `MCCLMLX` and `mccltrain`.
+        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.0"),
     ],
     targets: [
         .target(name: "MCCL"),
@@ -27,12 +39,43 @@ let package = Package(
         .target(name: "MCCLBenchmarks", dependencies: ["MCCL"]),
         .executableTarget(name: "mcclprobe", dependencies: ["MCCL"]),
         .executableTarget(name: "mcclbench", dependencies: ["MCCLBenchmarks", "MCCL"]),
+        // The MLX seam. `MCCL` is not allowed to depend on this; the arrow only
+        // points one way.
+        .target(
+            name: "MCCLMLX",
+            dependencies: [
+                "MCCL",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ]
+        ),
+        .executableTarget(
+            name: "mccltrain",
+            dependencies: [
+                "MCCLMLX",
+                "MCCL",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ]
+        ),
         .testTarget(
             name: "MCCLTests",
             dependencies: ["MCCL", "MCCLShim", "MCCLBenchmarks"],
             // The C program that exercises the ABI is compiled by the test that
             // runs it, with `cc` against the built dylib — not by SwiftPM.
             exclude: ["CProgram"]
+        ),
+        // The adapter's tests live apart from `MCCLTests` on purpose: the 237
+        // tests of the core library must keep running on a machine with no
+        // mlx.metallib, and must not acquire an MLX dependency by association.
+        .testTarget(
+            name: "MCCLMLXTests",
+            dependencies: [
+                "MCCLMLX",
+                "MCCL",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ]
         ),
     ]
 )

@@ -27,6 +27,25 @@ public enum BenchAlgorithm: String, CaseIterable, Sendable {
                                  interIslandRoot: 0)
         }
     }
+
+    /// Why this algorithm produces no rows for `worldSize`, or nil if it does.
+    ///
+    /// `plan(worldSize:)` returning nil used to make the sweep skip the
+    /// algorithm silently, which reads as a bug in the harness rather than as a
+    /// property of the world: an n=3 run asked for `hierarchical` and simply got
+    /// a table with no hierarchical rows in it and no explanation. Dropping the
+    /// rows is correct — three ranks on a uniform fabric have no islands — but
+    /// saying so is part of being correct.
+    public func inapplicabilityReason(worldSize: Int) -> String? {
+        guard plan(worldSize: worldSize) == nil else { return nil }
+        switch self {
+        case .hierarchical:
+            return "needs at least two islands of two ranks; a \(worldSize)-rank "
+                + "uniform fabric has none"
+        case .ring, .tree:
+            return "no plan for a \(worldSize)-rank world"
+        }
+    }
 }
 
 public enum BenchCollective: String, CaseIterable, Sendable {

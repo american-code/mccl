@@ -18,18 +18,29 @@ demonstrate, and it is called out again wherever it matters.
   - [4. Compress the wire](#4-compress-the-wire)
 - [Using the C API](#using-the-c-api)
 - [Benchmarking with mcclbench](#benchmarking-with-mcclbench)
+  - [Launching across machines: keep the ssh session attached](#launching-across-machines-keep-the-ssh-session-attached)
+- [Training with MLX](#training-with-mlx)
 - [Implementing what is missing](#implementing-what-is-missing)
 
 ## Build
 
 ```
-swift build            # debug:   .build/debug/{mcclprobe,mcclbench,libmccl.dylib}
+swift build            # debug:   .build/debug/{mcclprobe,mcclbench,mccltrain,libmccl.dylib}
 swift build -c release # release: .build/release/…
 swift test
 ```
 
-There are no external package dependencies and nothing to install. `xcodebuild`
-is not used or supported here.
+`MCCL` itself has **no external package dependencies** and nothing to install.
+`xcodebuild` is not used or supported here.
+
+One target does have a dependency, and it is kept apart on purpose: `MCCLMLX`,
+the MLX adapter, pulls in `mlx-swift`, and so does the `mccltrain` demo built on
+it. Nothing else in the package can see it — depend on `MCCL` and you get the
+same dependency-free library you always did. If you never build those two
+targets you never fetch mlx-swift.
+
+Anything touching MLX also needs one extra step after building; see
+[Training with MLX](#training-with-mlx).
 
 To depend on mccl from another SwiftPM package:
 
@@ -37,8 +48,12 @@ To depend on mccl from another SwiftPM package:
 // Package.swift
 dependencies: [.package(path: "/path/to/mccl")],
 targets: [
+    // The collectives library: no transitive dependencies.
     .executableTarget(name: "Trainer",
-                      dependencies: [.product(name: "MCCL", package: "mccl")])
+                      dependencies: [.product(name: "MCCL", package: "mccl")]),
+    // Or, if you are training with MLX — this one brings mlx-swift with it.
+    .executableTarget(name: "MLXTrainer",
+                      dependencies: [.product(name: "MCCLMLX", package: "mccl")]),
 ]
 ```
 
@@ -1148,6 +1163,55 @@ A point that fails aborts the run rather than continuing: the ranks have already
 diverged by then, and the next collective would hang instead of reporting
 anything.
 
+
+### Launching across machines: keep the ssh session attached
+
+**On macOS 26, a multi-node run launched with `nohup` from an ssh session that then
+exits will fail — and it fails in a way that looks like a bug in mccl.**
+
+The symptom is precise and reproducible: rank 0 comes up fine and its rendezvous
+listener accepts connections, while **every joining rank fails its outbound dial with
+`No route to host` (EHOSTUNREACH)** — over an interface that is up, to an address that
+pings, with no firewall rule to explain it. Debugging it from mccl's side is a dead end,
+because mccl is doing exactly what it is told and the kernel is refusing the connect.
+
+The cause is macOS's local-network privacy control. It gates *outbound unicast* dials to
+LAN addresses on the identity of the responsible process, and a binary that has been
+orphaned — its launching ssh session gone — is no longer attributable to an approved
+context. Inbound accepts are not gated, which is why rank 0 always looks healthy and only
+the joiners fail. Platform binaries are exempt, so `nc` to the same address and port
+succeeds from the same shell and appears to disprove the diagnosis. It does not: `nc` is
+a signed platform binary and mccl is not.
+
+What works:
+
+```
+# GOOD — session stays attached for the life of the run
+ssh lab-01 "mcclbench --rank 0 --world-size 3 --bind 192.168.1.238 --token-file /tmp/t.id ..." &
+ssh lab-02 "mcclbench --rank 1 --world-size 3 --bind 192.168.1.51  --token '<token>' ..." &
+wait
+```
+
+```
+# BAD — orphaned as soon as the ssh session exits; joiners get EHOSTUNREACH
+ssh lab-01 "nohup mcclbench --rank 0 ... >/tmp/r0.log 2>&1 &"
+ssh lab-02 "nohup mcclbench --rank 1 ... >/tmp/r1.log 2>&1 &"
+```
+
+The rules that follow:
+
+- **Keep every rank's ssh session attached** for the whole run. Background the local
+  `ssh` invocations and `wait` on them; do not background the *remote* process.
+- Or **launch under `launchd`**, or from a logged-in GUI session, which gives the process
+  a responsible context that survives.
+- If you must detach, expect to grant the binary local-network access in System Settings
+  → Privacy & Security → Local Network — and note that an unsigned binary rebuilt at a
+  new path is a new identity as far as that list is concerned.
+
+This applies to `mccltrain` exactly as it applies to `mcclbench`; nothing about it is
+specific to either. It cost an hour of diagnosis the first time.
+
+
 ### Reading the table
 
 ```
@@ -1230,41 +1294,473 @@ drive `BenchRunner.run(_:)` directly rather than scraping stdout.
 
 ---
 
+## Training with MLX
+
+`MCCLMLX` is the adapter that lets an MLX program hand mccl an `MLXArray` and get
+a reduced one back, and `mccltrain` is a working data-parallel training run built
+on it. This section covers both, plus the one build step MLX needs outside Xcode.
+
+- [First: fetch the Metal shader library](#first-fetch-the-metal-shader-library)
+- [The adapter API](#the-adapter-api)
+- [What gets copied, honestly](#what-gets-copied-honestly)
+- [Averaging gradients](#averaging-gradients)
+- [The demo: `mccltrain`](#the-demo-mccltrain)
+- [Correctness: the loss-trajectory proof](#correctness-the-loss-trajectory-proof)
+- [Measured: 2-node data-parallel training over Thunderbolt](#measured-2-node-data-parallel-training-over-thunderbolt)
+
+### First: fetch the Metal shader library
+
+**Do this before running anything that touches MLX, including `swift test`:**
+
+```
+Tools/fetch-metallib.sh
+```
+
+mlx-swift compiles MLX's C++ core under SwiftPM but does **not** build
+`mlx.metallib`, the compiled Metal shader library. That step belongs to Xcode's
+build system, and this project does not use `xcodebuild` — nor do the lab nodes
+have Xcode at all. Without the library MLX links and starts, then dies on the
+first GPU operation with `Failed to load the default metallib`, and it dies by
+aborting the process, so it cannot be caught and reported.
+
+The prebuilt, version-matched library ships inside the `mlx-metal` pip wheel, so
+the script takes it from there and drops it where MLX's loader looks: the
+directory of the *running binary*. That is `.build/<config>/` for `mccltrain`,
+and `.build/<config>/mcclPackageTests.xctest/Contents/MacOS/` for `swift test`;
+the script installs into every one it finds.
+
+The version must match the MLX core bundled by mlx-swift, which is **not** the
+mlx-swift package version — mlx-swift 0.31.4 bundles MLX core 0.31.1. The script
+reads it out of the checkout, so normally you pass nothing. Override both if you
+need to:
+
+```
+Tools/fetch-metallib.sh 0.31.1 /path/to/binary/dir
+```
+
+The technique is adapted from `Tools/fetch-metallib.sh` in SwiftSci, which hit
+this first. Two things were added for mccl: the version auto-detection above, and
+fetching the wheel with `curl` off PyPI's JSON index instead of `pip download`.
+The second matters more than it sounds — `pip download` resolves wheel *tags*, so
+a system pip old enough not to recognise a current tag reports the version as
+simply not existing. The lab nodes ship pip 21.2.4 on Python 3.9 and see
+`mlx-metal` only up to 0.29.3; `curl` fetches 0.31.1 without complaint. The
+metallib inside is a compiled Apple GPU shader library, so the wheel's Python tag
+is irrelevant to it.
+
+**Tests skip rather than crash.** Every test in `MCCLMLXTests` checks for the
+library before touching MLX and skips with the fix if it is missing. The 239
+tests of the core library never load MLX at all, so a machine without the
+metallib still runs them.
+
+### The adapter API
+
+The whole surface is an extension on `Communicator`. Import `MCCLMLX` and the
+collectives you already have start accepting arrays:
+
+```swift
+import MCCL
+import MCCLMLX
+import MLX
+
+let comm = try Communicator.join(uniqueID: id, rank: 0, worldSize: 2, bindHost: "169.254.152.222")
+
+let gradient = MLXArray(...)                       // fp32/fp16/bf16/int32/int8
+let summed   = try comm.allReduce(gradient, op: .sum)
+let averaged = try comm.allReduce(gradient, op: .avg, compression: .downcast)
+
+let everyRank = try comm.allGather(gradient)       // shape [worldSize] + gradient.shape
+let fromRoot  = try comm.broadcast(weights, root: 0)
+let onRoot    = try comm.reduce(gradient, op: .sum, root: 0)
+let myShard   = try comm.reduceScatter(gradient, op: .sum)
+```
+
+Five properties are worth knowing before you use it.
+
+**Synchronous.** These do not return an `async` value. `mlx.core.distributed`'s
+`all_sum` is synchronous from the caller's point of view and an MLX training loop
+is ordinary straight-line code, so the adapter blocks — the same bridge the C
+shim uses (`runBlocking`), for the same reason.
+
+**The input is never modified; a new array comes back.** MLX arrays share
+backings freely — `reshaped`, `broadcast`, a slice of a larger tensor — so
+reducing over the caller's storage would silently corrupt every array that
+happened to alias it.
+
+**Evaluation is forced for you.** An `MLXArray` is a graph node until something
+makes it a buffer, and mccl reduces buffers. Every entry point calls `eval()`
+first. This is also why the collective cannot be fused into a compiled MLX graph:
+the backward pass has to be *finished* before the network call can start.
+
+**Five dtypes, and no silent casts.** `float32`, `float16`, `bfloat16`, `int32`
+and `int8` map onto mccl's `DataType`. Anything else — `float64`, `int64`,
+`uint32`, `bool`, `complex64` — is an `MCCLError.invalidArgument` naming the
+dtype. Quietly narrowing a `float64` tensor to `float32` to make it fit would
+produce a plausible, wrong answer.
+
+**Compression is per-hop and invisible.** `compression:` changes what crosses the
+cable, never the dtype or shape you get back. `.topK` is the exception worth
+reading about: it keeps an error-feedback residual per `StreamID`, so two
+different tensors reduced on one communicator must not share one.
+`averageGradients` handles that; a caller reducing tensors one at a time must
+pass distinct stream IDs itself. See
+[Top-k: what you have to know before you use it](#top-k-what-you-have-to-know-before-you-use-it).
+
+### What gets copied, honestly
+
+The zero-copy property that actually matters is free and always holds: MLX
+allocates in **unified memory**, so the pointer handed to mccl is the same address
+the GPU reads. Nothing is staged across a bus. A CUDA equivalent of this adapter
+would have to `cudaMemcpy` every payload to host memory and back before NCCL
+could touch it; this one does not, and that is the structural advantage of the
+platform rather than anything clever in the code.
+
+What is *not* free is writing a result into an `MLXArray`, and the reason is not
+in any documentation:
+
+- mlx-swift's only public route to an array's bytes is `asData(access:)`, which
+  returns a Foundation `Data`. `Cmlx`, where `mlx_array_data_uint8` lives, is not
+  a public product of the package, so there is no supported way to ask an
+  `MLXArray` for a mutable pointer.
+- `Data(bytesNoCopy:count:deallocator:)` — which is what `.noCopy` builds — **is
+  not no-copy for small buffers.** Foundation stores payloads of 14 bytes or
+  fewer inline, copying them, and `withUnsafeBytes` then hands back the address
+  of that temporary. Writes through it are silently lost.
+
+The boundary was found by test, not by reading source, and it is pinned by one
+(`MLXBridgeTests.testFoundationInlinesSmallNoCopyData`): 14 bytes copies, 15
+bytes aliases. A bias vector of three floats is 12 bytes, so this is not a corner
+case — it is the corner case that would have made a whole class of small tensors
+reduce to a no-op with no error anywhere.
+
+So the adapter picks between two backings by payload size, and both are correct:
+
+| collective | payload | copies of the payload |
+|---|---|---|
+| `allGather`, `reduceScatter` | any | **none** — separate send and receive buffers, so the send side reads the input's backing and the receive side is written directly |
+| `allReduce`, `reduce`, `broadcast` | ≥ 64 B | **one**, host-to-host |
+| `allReduce`, `reduce`, `broadcast` | < 64 B | **two**, via a scratch buffer the adapter owns |
+
+The 64-byte threshold sits four times clear of Foundation's 14, and
+`MLXCollectiveTests.testAllReduceAcrossTheAdoptionThreshold` sweeps element
+counts across it — so the threshold is an implementation detail rather than a
+behaviour, and a change in Foundation shows up as a failing test rather than a
+wrong answer.
+
+**Is the remaining copy worth removing?** No, and here is the arithmetic. A
+memcpy runs at host memory bandwidth — ~100 GB/s measured on these machines,
+the same rate `Kernels.scale` achieves. The Thunderbolt fabric delivers 1.06
+GB/s. One copy of an N-byte payload therefore costs about **1%** of the time that
+payload spends on the cable, two costs about 2%. Removing it would buy a rounding
+error and cost the guarantee that passing an aliased array is safe.
+
+The one copy that is unavoidable is not a bridging artefact at all: mccl's
+all-reduce is in-place, so the output buffer has to start life holding this rank's
+contribution.
+
+### Averaging gradients
+
+```swift
+import MCCLMLX
+import MLXNN
+
+let lossAndGrad = valueAndGrad(model: model, lossFunction)
+
+for step in 0..<steps {
+    let (x, y) = shard(for: comm.rank)
+    let (loss, grads) = lossAndGrad(model, x, y)
+    eval(loss, grads)                                    // mccl needs bytes
+
+    let averaged = try averageGradients(grads, comm: comm)
+    optimizer.update(model: model, gradients: averaged)   // identical on every rank
+    eval(model, optimizer)
+
+    let worldLoss = try averageScalar(loss, comm: comm)   // the number to report
+}
+```
+
+`averageGradients` takes the tree `valueAndGrad` returns — a model does not hold
+gradients — and returns one with the same keys and shapes, holding the world
+average.
+
+**It is one collective, not one per parameter.** A small MLP has eight or ten
+gradient tensors, and each all-reduce over the cable costs at least one round trip
+— 167.8 µs measured — before a single byte of payload moves. Ten separate
+all-reduces would spend 1.7 ms on latency alone, more than the entire backward
+pass at this scale. The gradients are flattened into one contiguous buffer, so
+there is one round trip and the ring gets a message big enough to reach its
+bandwidth plateau. This is what `ncclGroupStart` exists for.
+
+**The layout is a function of the model's structure alone.** Parameter paths are
+sorted and dtype groups are taken in a fixed canonical order, because every rank
+has to lay its buffer out identically. Getting this wrong does not raise an
+error — the byte counts still match — it just averages unrelated numbers.
+
+**`averageScalar` is deliberately separate.** With equal shards the world mean of
+the per-rank losses is exactly the loss over the combined batch, which is the
+quantity to report. Fusing it into the gradient buffer would make the reported
+loss depend on the gradient compression setting, and a metric that moves when you
+change the wire codec is not a metric.
+
+**Equal shards are load-bearing.** The averaged gradient equals the full-batch
+gradient only when every rank contributes the same number of rows; `mccltrain`
+refuses a batch that does not divide evenly rather than quietly producing the
+wrong quantity.
+
+### The demo: `mccltrain`
+
+`mccltrain` trains an MLP on deterministic synthetic data, data-parallel across
+the world. It is an executable rather than a test because the lab nodes have no
+XCTest and the numbers that matter are measured on them.
+
+```
+mccltrain --verify              # correctness: 1 process vs 2 ranks, loss trajectories compared
+mccltrain --single              # 1 rank on the whole batch — the control, and the 1-node number
+mccltrain --rank N --token ...  # one rank of a real world across machines
+```
+
+Everything is seeded: weights come from a pure-Swift SplitMix64 rather than MLX's
+RNG (so two ranks agree without having to agree on MLX's stream), the dataset is
+a pure function of the seed and is generated identically on every rank, and each
+rank takes its shard by index rather than being sent one. The optimiser is plain
+SGD written out in four lines — not because Adam would be wrong, but because
+`p -= lr * g` makes the equivalence argument checkable by eye.
+
+The step is:
+
+```
+(loss, grads) = valueAndGrad(model, shard)     # local, on the GPU
+eval(loss, grads)                              # force the graph
+averaged      = averageGradients(grads, comm)  # one fused all-reduce
+SGD.step(model, averaged)                      # identical on every rank
+```
+
+Note what that shape rules out. SwiftSci's `Neural/Trainer.swift` — where the
+model and the compiled-training pattern here are adapted from — wraps forward,
+backward and the optimiser update in `compile(inputs: state, outputs: state)`,
+fusing the whole step into one Metal graph. That is not available here: the
+all-reduce sits between the backward pass and the update, on the host, so the
+step is necessarily cut in two. (The gotcha SwiftSci records — an optimiser whose
+state is allocated lazily *inside* a compiled trace silently stops updating — is
+avoided for free here, since SGD has no state.)
+
+Across machines it joins the same way `mcclbench` does, with the same discipline:
+
+```
+lab-01$ mccltrain --rank 0 --world-size 2 --bind 169.254.152.222 \
+                  --token-file /tmp/mt.id --steps 220 --warmup 20
+mccltrain: rank 0/2 joining mccl1:965fce25f920a9ef:169.254.152.222:60481
+
+lab-02$ mccltrain --rank 1 --world-size 2 --bind 169.254.23.203 \
+                  --token mccl1:965fce25f920a9ef:169.254.152.222:60481 \
+                  --steps 220 --warmup 20
+```
+
+**Keep the ssh sessions attached.** A `nohup`-detached rank whose ssh session has
+exited will fail every outbound dial with `No route to host` on macOS 26, while
+rank 0 keeps accepting quite happily — see
+[Launching across machines](#launching-across-machines-keep-the-ssh-session-attached).
+
+**Always pass `--bind` on a multi-homed machine.** Without it the listener binds a
+wildcard and advertises whatever `NetworkInterfaces.preferredLocalAddress()`
+prefers, which may not be the cable you meant to measure. Never use an mDNS
+`.local` name — it resolves over whichever path the resolver likes, and a pair of
+Macs with both Wi-Fi and Thunderbolt will silently give you the wrong one. Check
+the printed token names the address you expect, and check `netstat -ib` afterwards
+if it matters. **Only rank 0 prints the report**; the other ranks put one line on
+stderr.
+
+Every rank must be launched with the same model and batch flags. They are not
+fingerprinted the way `mcclbench`'s sweep is, so a mismatch will produce a size
+mismatch inside the collective rather than a clean message.
+
+### Correctness: the loss-trajectory proof
+
+The claim a data-parallel implementation has to earn is that it changes nothing:
+N ranks each computing gradients on 1/N of the batch and averaging must take the
+same optimisation path as one process on the whole batch. With equal shards and
+an optimiser that is a function of the gradient, this is an identity, not an
+approximation — so the two loss trajectories must agree to floating-point noise,
+and if the adapter is wrong anywhere that matters (a dropped write, a mis-ordered
+flatten, a wrong scale factor) they diverge, usually within a few steps.
+
+`--verify` runs both in one process — the control, and two ranks over **real TCP
+loopback sockets** so the wire format, the framing and the ring are all in the
+path — and compares step by step:
+
+```
+$ mccltrain --verify --steps 200
+mccltrain --verify
+  MLP 32-128-128-4  batch 256 (128/rank)  lr 0.05  seed 20260826  codec none
+  single process on the whole batch vs. 2 ranks over TCP loopback
+
+1 rank (control, whole batch)
+----------------------------------------------------------------
+  parameters        21252 (83.0 KiB per all-reduce)
+  timed steps       195 in 0.225 s
+  steps/sec         868.37
+  time in comms     0.6% (0.001 s)
+  loss              11.267978 -> 1.551678
+
+2 ranks (loopback, half batch each)
+----------------------------------------------------------------
+  parameters        21252 (83.0 KiB per all-reduce)
+  timed steps       195 in 0.639 s
+  steps/sec         305.22
+  time in comms     40.5% (0.259 s)
+  loss              11.267978 -> 1.551678
+
+loss-trajectory equivalence over 200 steps
+  max |1-rank - 2-rank|   4.768e-07  (at step 1)
+  max relative difference 1.807e-07
+  tolerance               1.000e-04
+  PASS — the 2-rank run is the same computation as the 1-rank run.
+```
+
+**4.768e-07 over 200 steps on losses of order 1–11** is one unit in the last
+place of fp32. The two runs are not close; they are the same arithmetic in a
+different order.
+
+The same holds across two real processes, which is the configuration the cluster
+runs:
+
+```
+$ mccltrain --single --steps 200 --losses /tmp/one.txt
+$ mccltrain --rank 0 --world-size 2 --bind 127.0.0.1 --token-file /tmp/t.id \
+            --steps 200 --losses /tmp/two.txt &
+$ mccltrain --rank 1 --world-size 2 --bind 127.0.0.1 --token-file /tmp/t.id --steps 200
+
+max |one - two| over 200 steps: 4.8e-07     final loss 1.5516783 vs 1.55167842
+```
+
+`--verify` also checks something the trajectory comparison cannot: that the two
+ranks agree with *each other* at every step. Ranks that stepped on different
+gradients would drift apart, and it names the first step where they differ rather
+than reporting an average that hides it.
+
+
+### Measured: 2-node data-parallel training over Thunderbolt
+
+Two Mac Studio M1 Max on the direct Thunderbolt cable, `--bind`ed to the TB
+addresses, 100 timed steps after 20 warm-up, best of three interleaved rounds.
+(Interleaved and best-of because `lab-01` shares its machine with an inference
+workload whose load moves by more than the effect under test — the identical point
+was observed at 50.3 and then 31.4 steps/s minutes apart. This is the method the
+rest of the project's cluster numbers already use.)
+
+Batch fixed at 256 global, model scaled:
+
+| model | parameters | gradient | 1 node | 2 nodes | 2 nodes, downcast | 2 nodes, int8/256 | time in comms |
+|---|---|---|---|---|---|---|---|
+| 32-128-128-4 | 21,252 | 83 KiB | **375.8** | 149.1 | 151.4 | 161.1 | 38.6% |
+| 32-512-512-4 | 281,604 | 1.07 MiB | **315.2** | 63.5 | 79.1 | 77.7 | 56.5% |
+| 32-1024-1024-1024-4 | 2,137,092 | 8.15 MiB | **142.3** | 19.7 | 24.9 | 23.4 | 78.3% |
+
+*(steps/sec; higher is better)*
+
+**Two nodes are slower than one at every model size, and scaling the model makes it
+worse rather than better** — 0.43×, 0.25×, 0.17× taking the best codec each time.
+That is the honest headline, and it is what the demo is for: prove the collective
+correct, then measure exactly how the communication/compute ratio is stacked.
+
+The codec rule reappears here, and correctly. At 83 KiB the step is latency-bound —
+167.8 µs of round trip before a byte moves — so halving the payload buys almost
+nothing (`downcast` 1.02×). At 1.07 MiB and 8.15 MiB it is bandwidth-bound and the
+codecs pay: **`downcast` 1.25× and 1.26×**, `int8/256` 1.23× and 1.19×. Both ceilings
+sit far above what this cable delivers, the rule predicts wins, and wins are what
+happen. They do not come close to rescuing the 2-node run.
+
+#### What would make it pay: batch, not model size
+
+The instinct is that a bigger model tips the balance. The table above says otherwise,
+and the reason is arithmetic. Under data parallelism the bytes communicated per step
+are `O(P)` — one gradient, once — while the compute per step is `O(P·B)`. Scaling `P`
+moves both terms together and the ratio does not budge. What moves it is `B`.
+
+So the prediction is that **increasing the global batch at fixed model size must cross
+over into a win**, and the measured constants say where. On the large model the
+all-reduce costs ~40 ms per step regardless of batch; one node computes a 256-row step
+in ~6.8 ms, two nodes a 128-row half-step in ~3.4 ms. Break-even is where 3.4 ms saved
+per 256 rows repays 40 ms — a global batch around 3,000.
+
+Measured, same model, batch swept:
+
+| global batch | 1 node | 2 nodes | 2-node speedup | time in comms |
+|---|---|---|---|---|
+| 256 | **186.2** | 49.4 | 0.27× | 69% |
+| 1,024 | **83.4** | 39.4 | 0.47× | 61% |
+| 4,096 | 27.4 | **29.6** | **1.08×** | 51% |
+| 16,384 | 7.5 | **10.9** | **1.45×** | 24% |
+
+The crossover lands between 1,024 and 4,096 — the predicted ~3,000 — and by 16,384 the
+second machine earns 1.45×. The ceiling is 2×, approached as the communication
+fraction goes to zero.
+
+**This cable pays for a second machine when the global batch is in the thousands, and
+not before.** For an MLP at batch 256 it is a pure loss, and no codec fixes that: the
+problem is a 167.8 µs round trip and a 1.06 GB/s link against a GPU that finishes the
+step in single-digit milliseconds. The two ways to move the line are more compute per
+byte communicated (larger batches, gradient accumulation, or a regime where
+activations rather than parameters dominate) or a faster fabric — which is what the
+unbuilt bulk-DMA Thunderbolt transport is for.
+
+#### Correctness on the cluster
+
+The loss-trajectory equivalence holds across the cable too, which is the check that
+matters most: it is the only one where the two ranks are genuinely different machines.
+
+```
+lab-01                 mccltrain --single --steps 220 --losses one.txt
+lab-01 + lab-02 / TB   mccltrain --rank 0|1 --world-size 2 --steps 220 --losses two.txt
+
+steps                    220
+max |1-node - 2-node|    3.624e-05   (at step 1)
+max relative difference  9.694e-06
+first loss               11.2679777   vs  11.2679777
+last loss                 1.32139528  vs   1.32140577
+```
+
+Looser than the 4.768e-07 measured inside one process, and expectedly so: the control
+computes the whole batch on `lab-01`, while the distributed run computes each half on
+a different physical GPU, so the matmul reduction orders differ. 1e-5 relative over
+220 steps is floating-point noise, not a disagreement.
+
+
+---
+
 ## Implementing what is missing
 
-Four things are declared, designed for, and not built. Each has a seam already
+Three things are declared, designed for, and not built. Each has a seam already
 cut for it; this section is enough to start any of them.
 
-### MLX adapter
+### MLX adapter — built; what is left is the head-to-head
 
-**Where it hooks.** MLX ships its own ring all-reduce over
-`mlx.core.distributed`. The adapter is a shim that lets MLX hand mccl an array
-and get a reduced one back, so `mcclbench` can be pointed at the same workload
-MLX's ring runs and produce head-to-head numbers.
+The adapter itself now exists: `MCCLMLX`, plus the `mccltrain` demo, documented
+at [Training with MLX](#training-with-mlx). It maps MLX dtypes onto `DataType`,
+forces evaluation and contiguity before handing over a pointer, holds one
+`Communicator` per group, and bridges async to sync exactly as the C shim does —
+the four behaviours this section originally asked for.
 
-MLX arrays are unified-memory buffers, which is the whole reason this is a shim
-and not a copy: mccl's collectives already take
-`UnsafeMutableRawBufferPointer` + `DataType` + element count, which is exactly
-what an `mlx::array`'s data pointer, dtype and size give you. The adapter needs
-to:
+What is *not* done is the comparison it was meant to enable, and the obstacle is
+worth writing down because it is not the one that was anticipated.
 
-1. Map MLX dtypes onto `DataType` (`float32`, `float16`, `bfloat16`, `int32`,
-   `int8` are all present; anything else is an error, not a silent cast).
-2. Ensure the array is evaluated and contiguous before handing over its pointer —
-   a lazily-evaluated or strided array has no single buffer to send.
-3. Hold one `Communicator` per MLX distributed group, and one `StreamID` per
-   tensor if the caller wants `.topK` (see the residual rules above).
-4. Bridge async to sync exactly as the C shim does — see `runBlocking` in
-   `Sources/MCCLShim/CABI.swift`. MLX's `all_sum` is synchronous from the
-   caller's point of view.
+**mlx-swift does not build MLX's distributed backends at all.** Its `Package.swift`
+excludes `mlx/distributed/{ring,mpi,nccl,jaccl}` outright — the comment there reads
+"do not build distributed support (yet)" — and there is no distributed API in the
+Swift layer to call even if it did. So a like-for-like Swift-against-Swift
+comparison of mccl's ring against MLX's ring cannot be built from this package,
+with or without Xcode. This is not a metallib problem or a lab-machine problem; it
+is simply not in mlx-swift.
 
-The natural place for it is a new target (`MCCLMLX`) depending on `MCCL`, kept
-out of the core library so `MCCL` stays dependency-free. The C shim is the model
-to copy: thin, no decisions, every rule stated once in `MCCL` and surfaced here
-as an error.
+The comparison that *is* reachable is cross-language: Python MLX ships the ring
+backend and `python3 -m mlx.distributed_run --backend ring` will drive it over the
+same Thunderbolt pair. It compares two different language runtimes rather than two
+schedulers, so read it as a sanity check on the fabric rather than as a verdict on
+either implementation; the numbers such as they are live in
+[COMPARISON.md](COMPARISON.md).
 
-**What "done" looks like:** `mcclbench` numbers and MLX-ring numbers for the same
-collective, same message sizes, on the same cluster.
+A genuine head-to-head would need mlx-swift to expose `mlx::distributed`, or a
+build of mlx-swift with those sources put back in.
 
 ### Thunderbolt transport
 
