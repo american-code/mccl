@@ -32,6 +32,8 @@ training framework.
   why top-k is an algorithm and not a codec, and what the numbers do and do not
   establish.
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — component-level design notes.
+- **[docs/COMPARISON.md](docs/COMPARISON.md)** — measured efficiency vs. published
+  NCCL numbers, and the codec-crossover rule NCCL has no equivalent of.
 
 ## Status
 
