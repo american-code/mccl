@@ -11,16 +11,21 @@
  *     cc app.c -I<mccl>/Sources/MCCLShim/include \
  *              -L<mccl>/.build/debug -lmccl -Wl,-rpath,<mccl>/.build/debug
  *
- * Threading. Every call blocks until the collective has completed on this rank.
- * NCCL enqueues onto a CUDA stream and returns; mccl v0 has no device queue to
- * enqueue onto, so `mcclStream_t` is not an execution context — it names an
- * independent *sequence* of collectives, which matters only to `mcclTopK`,
- * whose error-feedback residual is per-stream. Blocking here matches NCCL's
- * synchronous-enqueue semantics closely enough for a v0: the call returns when
- * it is safe to touch the buffers again.
+ * Threading. The plain collective calls block until the collective has
+ * completed on this rank. `mcclStream_t` is not an execution context — it names
+ * an independent *sequence* of collectives, which matters only to
+ * `mcclCompressTopK`, whose error-feedback residual is per-stream.
+ *
+ * For non-blocking issue, see mcclAllReduceAsync / mcclRequestWait /
+ * mcclRequestTest below. That is deliberately a *separate* entry point rather
+ * than a change of meaning for the existing one: NCCL gets its asynchrony from
+ * the CUDA stream the caller already has, mccl has no device queue to borrow,
+ * and turning `mcclAllReduce` non-blocking would break every caller that reads
+ * its buffer on return.
  *
  * One communicator must not be used concurrently from two threads. Different
- * communicators are independent.
+ * communicators are independent. Issuing several asynchronous operations from
+ * one thread is fine and is the point of them.
  *
  * License: Apache-2.0.
  */
@@ -253,6 +258,74 @@ mcclResult_t mcclReduceScatter(const void* sendbuff, void* recvbuff, size_t recv
 mcclResult_t mcclReduce(const void* sendbuff, void* recvbuff, size_t count,
                         mcclDataType_t datatype, mcclRedOp_t op, int root,
                         mcclComm_t comm, mcclStream_t stream);
+
+/* ------------------------------------------------- non-blocking collectives */
+
+/*
+ * An issued-but-not-finished collective.
+ *
+ * WHY A REQUEST AND NOT A STREAM. NCCL's asynchrony is the CUDA stream's:
+ * ncclAllReduce enqueues onto a stream the caller already owns and the caller
+ * synchronises that stream. mccl has no device queue to borrow, and its
+ * mcclStream_t already means something else — the sequence a top-k residual
+ * belongs to. Giving that handle a second job, and simultaneously turning every
+ * existing blocking call non-blocking, would break callers that read their
+ * buffer on return. So mccl takes MPI's shape instead: issue returns a handle,
+ * and the handle is waited or tested. mcclAllReduce still blocks and still
+ * means what it always meant.
+ *
+ * WHAT THE OVERLAP BUYS. Collectives on one communicator run on that
+ * communicator's serial queue, so two outstanding requests execute one after
+ * the other in the order they were issued — and that ordering is required, not
+ * a limitation: ranks must run collectives in the same order or they deadlock,
+ * and issue order is the only order every rank agrees on. What overlaps is the
+ * caller's own work with the collective's socket traffic, which on a Mac
+ * cluster is where the time goes.
+ */
+typedef struct mcclRequest* mcclRequest_t;
+
+/*
+ * Issues an all-reduce and returns immediately. `*request` receives the handle.
+ *
+ * The buffers belong to the collective until mcclRequestWait returns: do not
+ * read, write, or free them before then. In-place is expressed as it is
+ * everywhere else — pass the same pointer as sendbuff and recvbuff.
+ *
+ * Every request must eventually be waited. There is no free-without-wait, on
+ * purpose: abandoning a request would leave a collective writing into memory
+ * the caller believes it has back.
+ */
+mcclResult_t mcclAllReduceAsync(const void* sendbuff, void* recvbuff, size_t count,
+                                mcclDataType_t datatype, mcclRedOp_t op,
+                                mcclComm_t comm, mcclStream_t stream,
+                                mcclRequest_t* request);
+
+/* As mcclAllReduceAsync, with in-flight compression. Arguments as
+ * mcclAllReduceCompressed. */
+mcclResult_t mcclAllReduceCompressedAsync(const void* sendbuff, void* recvbuff, size_t count,
+                                          mcclDataType_t datatype, mcclRedOp_t op,
+                                          mcclCompression_t compression,
+                                          int32_t blockSize, double fraction,
+                                          mcclComm_t comm, mcclStream_t stream,
+                                          mcclRequest_t* request);
+
+/*
+ * Blocks until `request` completes, then frees it. The handle is invalid on
+ * return, whether the result was success or failure. Returns the collective's
+ * own result code; mcclGetLastError on the communicator has the detail.
+ */
+mcclResult_t mcclRequestWait(mcclRequest_t request);
+
+/*
+ * Reports whether `request` has completed, without blocking and without
+ * freeing it. `*done` is set to 1 or 0. A request that tests done must still be
+ * waited — that is what releases the handle.
+ *
+ * The return value describes the *test*, not the collective: it is mcclSuccess
+ * whenever the question could be answered. A failed collective reports its
+ * failure from mcclRequestWait.
+ */
+mcclResult_t mcclRequestTest(mcclRequest_t request, int* done);
 
 #ifdef __cplusplus
 }

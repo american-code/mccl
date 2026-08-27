@@ -265,7 +265,12 @@ final class MLXCollectiveTests: XCTestCase {
                 let gathered = try comm.allGather(mine)
                 results.set(comm.rank, (gathered.shape, gathered.floats))
             }
-            let expected = (0..<8).map { Float($0 + 1) } + (0..<8).map { Float(($0 + 1) * 2) }
+            // Spelled out in steps. As a single `+` of two mapped ranges this
+            // hit the type-checker's expression budget on a CI runner and
+            // failed to compile at all, which is a silly way to lose a suite.
+            let first: [Float] = (0..<8).map { Float($0 + 1) }
+            let second: [Float] = (0..<8).map { Float(($0 + 1) * 2) }
+            let expected: [Float] = first + second
             for rank in 0..<2 {
                 let (shape, values) = results.get(rank) ?? ([], [])
                 XCTAssertEqual(shape, [2, 8], "\(dtype)")

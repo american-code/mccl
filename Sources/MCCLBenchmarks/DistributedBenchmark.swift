@@ -101,6 +101,7 @@ public enum DistributedBenchRunner {
         _ options: BenchOptions,
         distributed: DistributedOptions,
         onBringup: (@Sendable (Bringup) -> Void)? = nil,
+        onPaths: (@Sendable (String) -> Void)? = nil,
         onRow: (@Sendable (BenchRow) -> Void)? = nil
     ) async throws -> [BenchRow] {
         var options = options
@@ -121,6 +122,7 @@ public enum DistributedBenchRunner {
             advertisedHosts: distributed.advertisedHosts,
             timeout: distributed.timeout)
         defer { comm.shutdown() }
+        onPaths?(comm.fabricPaths)
 
         // A mismatched grid deadlocks rather than fails, so rule it out first.
         try await checkAgreement(comm: comm, options: options)

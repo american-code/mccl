@@ -116,6 +116,52 @@ static void* rank_main(void* raw) {
               "topk allreduce[%d] = %f, expected %f", i, recv[i], expected_sum(i));
     }
 
+    /* ---- non-blocking all-reduce: issue N, then wait for all N ----
+     *
+     * The point of the shape, not just of the call: N buffers go out before
+     * anything is waited on, so the caller's own work between issue and wait
+     * overlaps the collectives' socket traffic. Each buffer carries a different
+     * multiplier so a request completing against the wrong buffer — or two
+     * requests running out of issue order across ranks — shows up as a wrong
+     * sum rather than as a hang. */
+    {
+        enum { INFLIGHT = 4 };
+        float* pipeline[INFLIGHT];
+        mcclRequest_t requests[INFLIGHT];
+        for (int k = 0; k < INFLIGHT; ++k) {
+            pipeline[k] = malloc(sizeof(float) * COUNT);
+            CHECK(pipeline[k] != NULL, "allocation failed");
+            for (int i = 0; i < COUNT; ++i) {
+                pipeline[k][i] = contribution(args->rank, i) * (float)(k + 1);
+            }
+            requests[k] = NULL;
+            CHECK_OK(mcclAllReduceAsync(pipeline[k], pipeline[k], COUNT, mcclFloat32,
+                                        mcclSum, comm, NULL, &requests[k]), comm);
+            CHECK(requests[k] != NULL, "async issue %d produced no request", k);
+        }
+
+        /* Testing is allowed to say "not yet" or "already done"; what it must
+         * not do is block, fail, or refuse a NULL check. */
+        int done = -1;
+        CHECK_OK(mcclRequestTest(requests[INFLIGHT - 1], &done), comm);
+        CHECK(done == 0 || done == 1, "test reported %d, expected a flag", done);
+        CHECK(mcclRequestTest(requests[0], NULL) == mcclInvalidArgument,
+              "NULL done out-parameter must be rejected");
+        CHECK(mcclRequestTest(NULL, &done) == mcclInvalidArgument,
+              "NULL request must be rejected");
+
+        for (int k = 0; k < INFLIGHT; ++k) {
+            CHECK_OK(mcclRequestWait(requests[k]), comm);
+            for (int i = 0; i < COUNT; ++i) {
+                float want = expected_sum(i) * (float)(k + 1);
+                CHECK(fabsf(pipeline[k][i] - want) < 1e-2f,
+                      "async allreduce %d [%d] = %f, expected %f", k, i, pipeline[k][i], want);
+            }
+            free(pipeline[k]);
+        }
+        CHECK(mcclRequestWait(NULL) == mcclInvalidArgument, "NULL request must be rejected");
+    }
+
     /* ---- all-gather ---- */
     for (int i = 0; i < COUNT; ++i) send[i] = (float)(args->rank * 1000 + (i % 10));
     CHECK_OK(mcclAllGather(send, gathered, COUNT, mcclFloat32, comm, NULL), comm);

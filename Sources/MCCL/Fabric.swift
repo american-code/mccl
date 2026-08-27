@@ -44,6 +44,19 @@ public final class MeshFabric: Fabric, @unchecked Sendable {
         return channel
     }
 
+    /// Peer rank -> the address this rank's channel to it actually runs over.
+    ///
+    /// For a peer this rank dialed, that is the address per-pair selection
+    /// chose out of the peer's advertisement. For a peer that dialed us, it is
+    /// the address it egressed from. Either way it names the cable, which is
+    /// the one thing a mixed-fabric run needs to be able to state rather than
+    /// assume: a table of numbers from a world whose paths are unknown says
+    /// nothing about the fabric it claims to measure.
+    public var paths: [Int: String] {
+        lock.lock(); defer { lock.unlock() }
+        return channels.mapValues(\.peerDescription)
+    }
+
     public func shutdown() {
         lock.lock()
         guard !isShutDown else { lock.unlock(); return }

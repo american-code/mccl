@@ -292,6 +292,23 @@ final class PeerAdvertisementTests: XCTestCase {
         return port
     }
 
+    /// A dial has to be cuttable short, or per-pair addressing cannot work: the
+    /// order it walks deliberately contains addresses that may be unreachable,
+    /// and a blocking `connect(2)` to one that silently drops SYNs parks for the
+    /// kernel's own TCP timeout — around 75 seconds — however little the caller
+    /// asked for.
+    ///
+    /// 192.0.2.0/24 is TEST-NET-1: reserved for documentation, so nothing
+    /// answers. Whether this machine's stack rejects it instantly or routes it
+    /// into a black hole, the call must come back inside its own deadline.
+    func testAConnectToABlackHoleRespectsItsTimeout() {
+        let start = Date()
+        XCTAssertThrowsError(try TCPTransport().connect(
+            to: PeerAddress(host: "192.0.2.1", port: 9), timeout: 1))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 15,
+                          "the deadline has to bound the connect, not just the retry")
+    }
+
     /// Every rank advertises a dead address first and its real one second, then
     /// the world is brought up over real loopback TCP.
     ///

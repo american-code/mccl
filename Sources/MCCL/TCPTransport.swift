@@ -23,27 +23,34 @@ public final class TCPTransport: Transport {
         try TCPListener(host: host, port: port, socketBufferBytes: socketBufferBytes)
     }
 
+    /// Opens a channel to `address`, giving up after `timeout`.
+    ///
+    /// The deadline is enforced on the connect itself, not merely on whether to
+    /// retry. That distinction is the whole difference between a bounded dial
+    /// and an unbounded one: a blocking `connect(2)` to an address that
+    /// silently drops SYNs parks for the kernel's own TCP timeout — around 75
+    /// seconds on macOS — whatever the caller asked for. Per-pair dialing walks
+    /// a peer's addresses expecting some of them to be unreachable, so an
+    /// attempt that cannot be cut short would make the good path unreachable
+    /// too.
     public func connect(to address: PeerAddress, timeout: TimeInterval) throws -> Channel {
         let deadline = Date().addingTimeInterval(timeout)
         var lastErrno: Int32 = 0
         repeat {
             let candidates = try SocketSupport.resolve(host: address.host, port: address.port, passive: false)
             for candidate in candidates {
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else { break }
                 let fd = socket(candidate.family, SOCK_STREAM, IPPROTO_TCP)
                 if fd < 0 { lastErrno = errno; continue }
                 SocketSupport.tune(fd: fd, bufferBytes: socketBufferBytes)
-                var addr = candidate.storage
-                let len = candidate.length
-                let rc = withUnsafePointer(to: &addr) { ptr -> Int32 in
-                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                        Darwin.connect(fd, sa, socklen_t(len))
-                    }
-                }
-                if rc == 0 {
+                switch SocketSupport.connect(fd: fd, to: candidate, within: remaining) {
+                case .connected:
                     return TCPChannel(fd: fd, peer: address.description)
+                case .failed(let e):
+                    lastErrno = e
+                    _ = Darwin.close(fd)
                 }
-                lastErrno = errno
-                _ = Darwin.close(fd)
             }
             // The peer's listener may not be up yet (cluster bring-up races).
             usleep(20_000)
@@ -216,6 +223,67 @@ enum SocketSupport {
         // Prefer IPv4 — a mixed cluster is far likelier to agree on it.
         candidates.sort { a, b in (a.family == AF_INET ? 0 : 1) < (b.family == AF_INET ? 0 : 1) }
         return candidates
+    }
+
+    enum ConnectOutcome {
+        case connected
+        case failed(Int32)
+    }
+
+    /// A connect that actually honours a deadline.
+    ///
+    /// Goes non-blocking for the duration: `connect` returns `EINPROGRESS`,
+    /// `poll` waits for writability up to the deadline, and `SO_ERROR` reports
+    /// what the handshake did. The descriptor is put back into blocking mode
+    /// before it is handed on, because every read and write after this point is
+    /// a blocking full-duplex transfer on its own dispatch queue.
+    static func connect(fd: Int32, to candidate: Candidate, within timeout: TimeInterval) -> ConnectOutcome {
+        var storage = candidate.storage
+        let length = socklen_t(candidate.length)
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            return .failed(errno)
+        }
+        func restoreBlocking() { _ = fcntl(fd, F_SETFL, flags) }
+
+        let rc = withUnsafePointer(to: &storage) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, length)
+            }
+        }
+        if rc == 0 {
+            restoreBlocking()
+            return .connected
+        }
+        guard errno == EINPROGRESS else {
+            let e = errno
+            restoreBlocking()
+            return .failed(e)
+        }
+
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        let milliseconds = Int32(max(0, min(timeout * 1000, Double(Int32.max))))
+        var ready: Int32 = 0
+        repeat {
+            ready = poll(&pfd, 1, milliseconds)
+        } while ready < 0 && errno == EINTR
+        guard ready > 0 else {
+            let e: Int32 = ready == 0 ? ETIMEDOUT : errno
+            restoreBlocking()
+            return .failed(e)
+        }
+
+        // Writable does not mean connected: a refused or unreachable peer wakes
+        // the poll too, and only SO_ERROR distinguishes them.
+        var pending: Int32 = 0
+        var size = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &pending, &size) == 0 else {
+            let e = errno
+            restoreBlocking()
+            return .failed(e)
+        }
+        restoreBlocking()
+        return pending == 0 ? .connected : .failed(pending)
     }
 
     static func boundPort(fd: Int32) throws -> Int {

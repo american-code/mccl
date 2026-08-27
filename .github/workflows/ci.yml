@@ -54,8 +54,12 @@ jobs:
       - name: Build
         run: swift build -v 2>&1 | tail -40
 
+      # pipefail matters here: without it the step's exit status is `tee`'s, so
+      # a suite that failed to compile — or failed outright — reports success.
       - name: Test
-        run: swift test 2>&1 | tee test-output.txt
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee test-output.txt
 
       # The MLX tests are allowed to skip, but only for the one reason. A skip
       # that started happening for some other reason — or a suite that silently

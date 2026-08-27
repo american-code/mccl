@@ -22,7 +22,7 @@ public final class Communicator: @unchecked Sendable {
     /// Every collective runs here, one at a time. Collectives block on socket
     /// I/O; keeping them off the Swift concurrency cooperative pool means a
     /// rank waiting on a peer never starves another rank's progress.
-    private let workQueue: DispatchQueue
+    let workQueue: DispatchQueue
 
     /// Error-feedback state for `.topK`, one residual per `StreamID`. Nothing
     /// else in mccl is stateful across calls; this is what makes sparsified
@@ -49,6 +49,15 @@ public final class Communicator: @unchecked Sendable {
 
     /// Releases the transport. Safe to call more than once.
     public func shutdown() { fabric?.shutdown() }
+
+    /// One line naming the address this rank reaches each peer on, in rank
+    /// order — what per-pair selection actually decided, rather than what it
+    /// was expected to decide. Empty for a fabric that does not report paths.
+    public var fabricPaths: String {
+        guard let mesh = fabric as? MeshFabric else { return "" }
+        let paths = mesh.paths
+        return paths.keys.sorted().map { "\($0)=\(paths[$0]!)" }.joined(separator: " ")
+    }
 
     // MARK: - Bring-up
 

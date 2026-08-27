@@ -149,6 +149,18 @@ if options.codecBench {
                 }
                 note("rank 0 token \(bringup.uniqueID.text)")
             },
+            onPaths: { paths in
+                // Which cable each pair settled on. On a mixed fabric this is
+                // the difference between a table about Thunderbolt and a table
+                // about Wi-Fi, so every rank states it rather than leaving it to
+                // be inferred afterwards.
+                //
+                // stderr, not stdout: stdout is the table, and under --csv it is
+                // something a launcher parses. A provenance line does not belong
+                // in a data stream.
+                guard !paths.isEmpty else { return }
+                note("rank \(distributed.rank) paths: \(paths)")
+            },
             onRow: { row in
                 guard isReporter else { return }
                 if header.claim() {

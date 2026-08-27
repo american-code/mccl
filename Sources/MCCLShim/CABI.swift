@@ -429,6 +429,92 @@ public func mcclAllReduceCompressed(
     }
 }
 
+// MARK: - Exports: non-blocking collectives
+
+/// What `mcclRequest_t` points at: the in-flight collective plus the
+/// communicator whose error slot its failure belongs in.
+final class RequestHandle {
+    let request: CollectiveRequest
+    let errors: ErrorSlot
+
+    init(_ request: CollectiveRequest, errors: ErrorSlot) {
+        self.request = request
+        self.errors = errors
+    }
+
+    static func from(_ pointer: UnsafeMutableRawPointer?) throws -> RequestHandle {
+        guard let pointer else { throw MCCLError.invalidArgument("request is NULL") }
+        return Unmanaged<RequestHandle>.fromOpaque(pointer).takeUnretainedValue()
+    }
+}
+
+@_cdecl("mcclAllReduceAsync")
+public func mcclAllReduceAsync(
+    _ send: UnsafeRawPointer?, _ recv: UnsafeMutableRawPointer?, _ count: Int,
+    _ datatype: Int32, _ op: Int32,
+    _ comm: UnsafeMutableRawPointer?, _ stream: UnsafeMutableRawPointer?,
+    _ request: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
+) -> Int32 {
+    mcclAllReduceCompressedAsync(send, recv, count, datatype, op, 0, 0, 0, comm, stream, request)
+}
+
+@_cdecl("mcclAllReduceCompressedAsync")
+public func mcclAllReduceCompressedAsync(
+    _ send: UnsafeRawPointer?, _ recv: UnsafeMutableRawPointer?, _ count: Int,
+    _ datatype: Int32, _ op: Int32,
+    _ codec: Int32, _ blockSize: Int32, _ fraction: Double,
+    _ comm: UnsafeMutableRawPointer?, _ stream: UnsafeMutableRawPointer?,
+    _ request: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
+) -> Int32 {
+    let handle = try? CommHandle.from(comm)
+    return guarded(handle?.errors ?? .global) {
+        guard let request else {
+            throw MCCLError.invalidArgument("mcclAllReduceAsync: request out-parameter is NULL")
+        }
+        let handle = try CommHandle.from(comm)
+        let type = try dataType(datatype)
+        // The in-place copy happens here, synchronously, so `sendbuff` is
+        // released the moment this call returns even though the collective is
+        // still running against `recvbuff`.
+        let buffer = try destination(send: send, recv: recv,
+                                     byteCount: count * type.byteWidth, label: "mcclAllReduceAsync")
+        let reduction = try reduceOp(op)
+        let scheme = try compression(codec, blockSize: blockSize, fraction: fraction)
+        let pending = handle.communicator.allReduceAsync(
+            buffer, count: count, dataType: type, op: reduction,
+            compression: scheme, stream: streamID(stream))
+        request.pointee = Unmanaged.passRetained(
+            RequestHandle(pending, errors: handle.errors)).toOpaque()
+    }
+}
+
+@_cdecl("mcclRequestWait")
+public func mcclRequestWait(_ raw: UnsafeMutableRawPointer?) -> Int32 {
+    let handle = try? RequestHandle.from(raw)
+    let code = guarded(handle?.errors ?? .global) {
+        let handle = try RequestHandle.from(raw)
+        try handle.request.wait()
+    }
+    // Freed whichever way it went: the contract is that the handle is invalid
+    // on return, so there is nothing left to release it later.
+    if let raw { Unmanaged<RequestHandle>.fromOpaque(raw).release() }
+    return code
+}
+
+@_cdecl("mcclRequestTest")
+public func mcclRequestTest(
+    _ raw: UnsafeMutableRawPointer?, _ done: UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    let handle = try? RequestHandle.from(raw)
+    return guarded(handle?.errors ?? .global) {
+        let handle = try RequestHandle.from(raw)
+        guard let done else {
+            throw MCCLError.invalidArgument("mcclRequestTest: done out-parameter is NULL")
+        }
+        done.pointee = handle.request.isFinished ? 1 : 0
+    }
+}
+
 @_cdecl("mcclAllGather")
 public func mcclAllGather(
     _ send: UnsafeRawPointer?, _ recv: UnsafeMutableRawPointer?, _ sendcount: Int,
