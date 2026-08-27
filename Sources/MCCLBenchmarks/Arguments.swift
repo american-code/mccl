@@ -73,10 +73,10 @@ public enum BenchArguments {
     --bind: without it a wildcard bind advertises whichever address the host
     prefers, and the traffic may not cross the cable you meant to measure.
 
-      lab-01$ mcclbench --rank 0 --world-size 2 --bind 169.254.152.222 \\
-                        --token-file /tmp/tb.id --sizes 64K,1M,64M
-      lab-02$ mcclbench --rank 1 --world-size 2 --bind 169.254.23.203 \\
-                        --token <the token rank 0 printed>
+      studio-a$ mcclbench --rank 0 --world-size 2 --bind 169.254.152.222 \\
+                          --token-file /tmp/tb.id --sizes 64K,1M,64M
+      studio-b$ mcclbench --rank 1 --world-size 2 --bind 169.254.23.203 \\
+                          --token <the token rank 0 printed>
 
     Every rank must be given the same grid — the sweep is checked against its
     peers at bring-up and a mismatch is an error rather than a deadlock. Only

@@ -371,14 +371,14 @@ on the wire codecs that is not an extrapolation from loopback.
 > vectorising would flip the verdict was made from them, and a prediction is only
 > worth something next to the data that produced it.
 
-**Setup.** Two Mac Studio M1 Max (`lab-01`, `lab-02`) joined by a direct Thunderbolt
+**Setup.** Two Mac Studio M1 Max (`studio-a`, `studio-b`) joined by a direct Thunderbolt
 cable, negotiated at 20 Gb/s, probed by `mcclprobe measure` at **1.06 GB/s and
-167.8 µs**. `mcclbench` release builds, rank 0 on `lab-01` bound to `169.254.152.222`,
-rank 1 on `lab-02` bound to `169.254.23.203`, all-reduce fp32 sum, ring.
+167.8 µs**. `mcclbench` release builds, rank 0 on `studio-a` bound to `169.254.152.222`,
+rank 1 on `studio-b` bound to `169.254.23.203`, all-reduce fp32 sum, ring.
 
 That the traffic really crossed the cable is checked rather than assumed: the token
 was verified to advertise `169.254.152.222` before rank 1 was started, and over one
-sweep `lab-01`'s `en4` byte counters moved **+1.11 GB in and +1.11 GB out** while `en0`
+sweep `studio-a`'s `en4` byte counters moved **+1.11 GB in and +1.11 GB out** while `en0`
 stayed at zero.
 
 ### All-reduce over the Thunderbolt cable
@@ -408,7 +408,7 @@ of the link is reachable.
 
 ### The codecs really do shrink the wire
 
-Measured directly from `lab-01`'s `en4` output counter over five 64 MiB collectives,
+Measured directly from `studio-a`'s `en4` output counter over five 64 MiB collectives,
 so this is bytes on the cable and not an accounting of what the encoder believes:
 
 | codec | bytes sent | vs. uncompressed | payload sent |
@@ -512,7 +512,7 @@ is "the executor exploits full duplex", not "topology selection is validated" �
 distinction that mattered until the n = 3 run below, which is where selection actually
 gets tested.
 
-**Noise.** `lab-01` is a shared machine and was running an unrelated inference workload
+**Noise.** `studio-a` is a shared machine and was running an unrelated inference workload
 (~40% of one core) throughout. Worst-case points ran up to 5× the best in the same
 sweep, which is why every figure above is the best of several full sweeps rather than a
 single run, and why medians are recorded alongside in the raw output. The verdict is not
@@ -555,7 +555,7 @@ comparable.
 
 Round-trip ceiling, GB/s of payload, best point per codec:
 
-| codec | M1 Pro scalar → vector | M1 Max (`lab-02`, idle) scalar → vector | M1 Max (`lab-01`, shared) scalar → vector |
+| codec | M1 Pro scalar → vector | M1 Max (`studio-b`, idle) scalar → vector | M1 Max (`studio-a`, shared) scalar → vector |
 |---|---|---|---|
 | none (memcpy) | 33.63 → 32.21 | 35.37 → 30.68 | 7.46 → 11.91 |
 | downcast | 3.55 → **36.89** (10.4×) | 3.67 → **31.80** (8.7×) | 0.89 → **10.79** (12.1×) |
@@ -566,7 +566,7 @@ Two things in that table were not expected.
 
 **The scalar codecs were never as slow as ~0.50 GB/s.** On an idle M1 Max the scalar
 `downcast` kernel already ran at 3.67 GB/s round-trip — five times the cable. The
-0.50/0.28/0.16 figures above are what `lab-01` achieved, and `lab-01` runs EXO.app;
+0.50/0.28/0.16 figures above are what `studio-a` achieved, and `studio-a` runs EXO.app;
 its scalar ceilings measure 0.89/0.19/0.21. Since the reported wall time is the
 *slowest* rank's, the collective was gated by the loaded machine's codec rate, and
 the plateau landed at ~56% of that machine's kernel ceiling — the rest of a
@@ -595,7 +595,7 @@ miss per comparison before) is most of the 1.9×.
 ### All-reduce over the Thunderbolt cable, vectorised vs scalar
 
 Both binaries were run **alternately in the same session** — `mccl-scalar` is the
-previous commit built from `git archive HEAD` — because `lab-01`'s load moved by more
+previous commit built from `git archive HEAD` — because `studio-a`'s load moved by more
 than the effect under test while the sweeps ran (load average 4 → 29 → 15 over the
 hour; worst/best within a size reached 10×). 32 scalar and 28 vectorised complete
 sweeps. Bus bandwidth in GB/s, best of all sweeps, speed-up against `none` in
@@ -641,7 +641,7 @@ comfortably above the fabric: past that point the codec's rate stops mattering a
 only its compression ratio does, and int8 puts 3.94× fewer bytes on the wire against
 downcast's 2.00×. That is the regime the Wi-Fi table has always been in.
 
-`topk/0.01` is the control that keeps the rule honest. Its ceiling on `lab-01` rose
+`topk/0.01` is the control that keeps the rule honest. Its ceiling on `studio-a` rose
 from 0.19 to 0.36 GB/s — a real 1.9× and still *below* the 0.53–0.66 GB/s the cable
 delivers uncompressed. The rule says it should lose, and it does (0.54–1.15× at
 bandwidth-bound sizes), while continuing to win at 64 KiB where the run is
@@ -651,7 +651,7 @@ not stayed lost.
 
 ### The frames did not change
 
-Re-measured at `lab-01`'s `en4` counters, five 64 MiB collectives per codec, with the
+Re-measured at `studio-a`'s `en4` counters, five 64 MiB collectives per codec, with the
 vectorised build:
 
 | codec | bytes out | vs. uncompressed | scalar build measured |

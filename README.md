@@ -340,10 +340,10 @@ Across machines, one process per rank, discovering each other through a rendezvo
 token — the same grid, the same table, over a real cable:
 
 ```
-lab-01$ mcclbench --rank 0 --world-size 2 --bind 169.254.152.222 \
-                  --token-file /tmp/tb.id --sizes 64K,1M,64M
-lab-02$ mcclbench --rank 1 --world-size 2 --bind 169.254.23.203 \
-                  --token mccl1:f5a44d951e3024b2:169.254.152.222:60278
+studio-a$ mcclbench --rank 0 --world-size 2 --bind 169.254.152.222 \
+                    --token-file /tmp/tb.id --sizes 64K,1M,64M
+studio-b$ mcclbench --rank 1 --world-size 2 --bind 169.254.23.203 \
+                    --token mccl1:f5a44d951e3024b2:169.254.152.222:60278
 ```
 
 Pass `--bind` on any machine with more than one interface: it pins both the listener

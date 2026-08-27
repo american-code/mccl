@@ -347,8 +347,8 @@ measured in §5.1a.
 
 `mcclbench` now runs distributed — one process per machine, joining through the
 same `Rendezvous` token the C shim uses — so the same sweep that ran over
-loopback runs over the cable of §5.1. Rank 0 on `lab-01` bound to
-`169.254.152.222`, rank 1 on `lab-02` bound to `169.254.23.203`, all-reduce fp32
+loopback runs over the cable of §5.1. Rank 0 on `studio-a` bound to
+`169.254.152.222`, rank 1 on `studio-b` bound to `169.254.23.203`, all-reduce fp32
 sum, ring, best of five sweeps. Bus bandwidth in GB/s; with n = 2 the bus factor
 is 1, and the parenthesised figure is the fraction of the 1.06 GB/s probed link.
 
@@ -369,7 +369,7 @@ the ring schedule is where the time goes.
 **The codec verdict, which §5.3 left open, goes against the codecs.** §5.3 called
 it "an arithmetic question only the cluster can settle". The cluster has settled
 it: on a 1.06 GB/s Thunderbolt link every codec loses above 256 KiB. `downcast`
-puts exactly half as many bytes on the wire — verified at `lab-01`'s `en4` byte
+puts exactly half as many bytes on the wire — verified at `studio-a`'s `en4` byte
 counter, 168.1 MB against 336.1 MB over five 64 MiB collectives, with `int8/256`
 at 3.94× and `topk/0.01` at 49.9× reduction — and is still 25–32% slower.
 
@@ -429,7 +429,7 @@ only begin to at n ≥ 4. **§3.2's planner is therefore unvalidated on hardware
 and stays that way until a 3+ node run.** That, not another 2-node sweep, is the
 experiment that would test it.
 
-*Method.* `lab-01` was shared with an unrelated workload throughout, and
+*Method.* `studio-a` was shared with an unrelated workload throughout, and
 worst-case points reached 5× the best within a sweep, so every figure is the best
 of several complete sweeps. The verdict does not depend on that choice: `none`
 beats every codec above 256 KiB on Thunderbolt, and loses to every codec on
@@ -453,7 +453,7 @@ else in a compressed call. `mcclbench --codec-bench` now measures the kernels
 directly, in payload GB/s, through the same code path a ring step runs. The first
 result is a correction to §5.1a: the scalar `downcast` kernel on an *idle* M1 Max
 runs at 3.67 GB/s round-trip, five times the cable, not 0.50. The low figures
-belong to `lab-01`, which shares its machine with an inference workload and, as
+belong to `studio-a`, which shares its machine with an inference workload and, as
 the slower rank, sets the reported time. Its scalar ceilings are 0.89 (downcast),
 0.21 (int8/256), 0.19 (topk/0.01) GB/s — and the compressed plateaus of §5.1a
 land at ~56% of those, the remainder being sockets, framing and reduction. The
@@ -508,7 +508,7 @@ narrowing to `vDSP_vfix8`. Top-k gains least because its cost is selection
 traffic, not arithmetic: five passes over the tensor whatever the instruction set.
 
 **The wire is unchanged**, measured rather than asserted: five 64 MiB collectives
-per codec moved 336.3 / 168.1 / 85.3 / 6.7 MB across `lab-01`'s `en4` counters
+per codec moved 336.3 / 168.1 / 85.3 / 6.7 MB across `studio-a`'s `en4` counters
 under the vectorised build, against 336.1 / 168.1 / 85.3 / 6.7 MB under the
 scalar one.
 

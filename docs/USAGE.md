@@ -90,10 +90,10 @@ $ mcclprobe measure 127.0.0.1:7811 127.0.0.1:7812 127.0.0.1:7813 \
   measuring 2 <-> 3 (127.0.0.1:7812 -> 127.0.0.1:7813)
 
 nodes
-    0  mbp.local               Apple M1 Pro      16 GB
-    1  mbp.local               Apple M1 Pro      16 GB
-    2  mbp.local               Apple M1 Pro      16 GB
-    3  mbp.local               Apple M1 Pro      16 GB
+    0  laptop.local            Apple M1 Pro      16 GB
+    1  laptop.local            Apple M1 Pro      16 GB
+    2  laptop.local            Apple M1 Pro      16 GB
+    3  laptop.local            Apple M1 Pro      16 GB
 
 links
     0 <-> 1   loopback          2.35 GB/s   rtt 68.0 µs
@@ -199,7 +199,7 @@ print("plan at 4 MiB: \(TopologyPlanner.plan(for: topology, messageBytes: 4 << 2
 
 ```
 serving on 127.0.0.1:59414
-127.0.0.1:59414 is mbp.local (Apple M1 Pro), 3.47 GB/s, rtt 61.8 µs
+127.0.0.1:59414 is laptop.local (Apple M1 Pro), 3.47 GB/s, rtt 61.8 µs
   measuring 0 <-> 1 (127.0.0.1:59414)
   measuring 0 <-> 2 (127.0.0.1:59416)
   measuring 1 <-> 2 (127.0.0.1:59414 -> 127.0.0.1:59416)
@@ -1068,7 +1068,7 @@ receiving half, and the two in series:
 $ mcclbench --codec-bench --ranks 2 --sizes 1M,16M
 
 mccl codec throughput — fp32, 2 ranks assumed for top-k's receive side
-host: lab-02.local, Apple M1 Max
+host: studio-b.local, Apple M1 Max
 payload GB/s: the caller's bytes through the codec, best of 5
 
         size  codec            ratio    GB/s enc    GB/s dec    GB/s r/t    ns/elem
@@ -1126,13 +1126,13 @@ Rank 0 creates the token and must be started first, because `createUniqueID`
 binds the listener the token describes:
 
 ```
-lab-01$ mcclbench --rank 0 --world-size 2 --bind 169.254.152.222 \
-                  --token-file /tmp/tb.id --sizes 64K,1M,64M --algorithms ring
+studio-a$ mcclbench --rank 0 --world-size 2 --bind 169.254.152.222 \
+                    --token-file /tmp/tb.id --sizes 64K,1M,64M --algorithms ring
 mcclbench: rank 0 token mccl1:f5a44d951e3024b2:169.254.152.222:60278
 
-lab-02$ mcclbench --rank 1 --world-size 2 --bind 169.254.23.203 \
-                  --token mccl1:f5a44d951e3024b2:169.254.152.222:60278 \
-                  --sizes 64K,1M,64M --algorithms ring
+studio-b$ mcclbench --rank 1 --world-size 2 --bind 169.254.23.203 \
+                    --token mccl1:f5a44d951e3024b2:169.254.152.222:60278 \
+                    --sizes 64K,1M,64M --algorithms ring
 ```
 
 Four things are worth knowing before you trust the numbers that come out:
@@ -1187,15 +1187,15 @@ What works:
 
 ```
 # GOOD — session stays attached for the life of the run
-ssh lab-01 "mcclbench --rank 0 --world-size 3 --bind 192.168.1.238 --token-file /tmp/t.id ..." &
-ssh lab-02 "mcclbench --rank 1 --world-size 3 --bind 192.168.1.51  --token '<token>' ..." &
+ssh studio-a "mcclbench --rank 0 --world-size 3 --bind 192.168.1.238 --token-file /tmp/t.id ..." &
+ssh studio-b "mcclbench --rank 1 --world-size 3 --bind 192.168.1.51  --token '<token>' ..." &
 wait
 ```
 
 ```
 # BAD — orphaned as soon as the ssh session exits; joiners get EHOSTUNREACH
-ssh lab-01 "nohup mcclbench --rank 0 ... >/tmp/r0.log 2>&1 &"
-ssh lab-02 "nohup mcclbench --rank 1 ... >/tmp/r1.log 2>&1 &"
+ssh studio-a "nohup mcclbench --rank 0 ... >/tmp/r0.log 2>&1 &"
+ssh studio-b "nohup mcclbench --rank 1 ... >/tmp/r1.log 2>&1 &"
 ```
 
 The rules that follow:
@@ -1547,13 +1547,13 @@ avoided for free here, since SGD has no state.)
 Across machines it joins the same way `mcclbench` does, with the same discipline:
 
 ```
-lab-01$ mccltrain --rank 0 --world-size 2 --bind 169.254.152.222 \
-                  --token-file /tmp/mt.id --steps 220 --warmup 20
+studio-a$ mccltrain --rank 0 --world-size 2 --bind 169.254.152.222 \
+                    --token-file /tmp/mt.id --steps 220 --warmup 20
 mccltrain: rank 0/2 joining mccl1:965fce25f920a9ef:169.254.152.222:60481
 
-lab-02$ mccltrain --rank 1 --world-size 2 --bind 169.254.23.203 \
-                  --token mccl1:965fce25f920a9ef:169.254.152.222:60481 \
-                  --steps 220 --warmup 20
+studio-b$ mccltrain --rank 1 --world-size 2 --bind 169.254.23.203 \
+                    --token mccl1:965fce25f920a9ef:169.254.152.222:60481 \
+                    --steps 220 --warmup 20
 ```
 
 **Keep the ssh sessions attached.** A `nohup`-detached rank whose ssh session has
@@ -1643,7 +1643,7 @@ than reporting an average that hides it.
 
 Two Mac Studio M1 Max on the direct Thunderbolt cable, `--bind`ed to the TB
 addresses, 100 timed steps after 20 warm-up, best of three interleaved rounds.
-(Interleaved and best-of because `lab-01` shares its machine with an inference
+(Interleaved and best-of because `studio-a` shares its machine with an inference
 workload whose load moves by more than the effect under test — the identical point
 was observed at 50.3 and then 31.4 steps/s minutes apart. This is the method the
 rest of the project's cluster numbers already use.)
@@ -1710,8 +1710,8 @@ The loss-trajectory equivalence holds across the cable too, which is the check t
 matters most: it is the only one where the two ranks are genuinely different machines.
 
 ```
-lab-01                 mccltrain --single --steps 220 --losses one.txt
-lab-01 + lab-02 / TB   mccltrain --rank 0|1 --world-size 2 --steps 220 --losses two.txt
+studio-a                   mccltrain --single --steps 220 --losses one.txt
+studio-a + studio-b / TB   mccltrain --rank 0|1 --world-size 2 --steps 220 --losses two.txt
 
 steps                    220
 max |1-node - 2-node|    3.624e-05   (at step 1)
@@ -1721,7 +1721,7 @@ last loss                 1.32139528  vs   1.32140577
 ```
 
 Looser than the 4.768e-07 measured inside one process, and expectedly so: the control
-computes the whole batch on `lab-01`, while the distributed run computes each half on
+computes the whole batch on `studio-a`, while the distributed run computes each half on
 a different physical GPU, so the matmul reduction orders differ. 1e-5 relative over
 220 steps is floating-point noise, not a disagreement.
 
