@@ -53,8 +53,7 @@ if !options.csv, isReporter {
         print("mccl benchmark — \(options.collective.rawValue), \(distributed.worldSize) ranks over "
               + "\(distributed.label.map { "\($0), " } ?? "")distributed tcp, "
               + "\(options.dataType), op \(options.op)")
-        print("rank 0 host: \(identity.hostname), \(identity.chip)"
-              + (distributed.bindHost.map { ", bound \($0)" } ?? ""))
+        print("rank 0 host: \(identity.hostname), \(identity.chip), \(distributed.bindSummary)")
         print("wall time is the slowest rank's for each point")
     } else {
         print("mccl benchmark — \(options.collective.rawValue), \(options.worldSize) ranks over "

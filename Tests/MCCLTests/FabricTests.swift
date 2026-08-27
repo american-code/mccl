@@ -40,7 +40,7 @@ final class FabricTests: XCTestCase {
             guard case MCCLError.invalidArgument(let what) = error else {
                 return XCTFail("expected .invalidArgument, got \(error)")
             }
-            XCTAssertTrue(what.contains("expected 4 peer addresses, got 1"), what)
+            XCTAssertTrue(what.contains("expected 4 peer advertisements, got 1"), what)
         }
     }
 

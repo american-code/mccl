@@ -220,7 +220,11 @@ static void test_standalone(void) {
           mcclGetLastError(NULL));
     char text[MCCL_UNIQUE_ID_BYTES] = {0};
     CHECK(mcclUniqueIdToString(&id, text, sizeof(text)) == mcclSuccess, "id -> text failed");
-    CHECK(strncmp(text, "mccl1:", 6) == 0, "unexpected id text '%s'", text);
+    /* mccl1 on a single-homed host, mccl2 once rank 0 has more than one
+     * address to advertise. Both are current; which one appears depends on the
+     * machine the test runs on, so accept either. */
+    CHECK(strncmp(text, "mccl1:", 6) == 0 || strncmp(text, "mccl2:", 6) == 0,
+          "unexpected id text '%s'", text);
     CHECK(mcclUniqueIdFromString(text, &restored) == mcclSuccess, "text -> id failed");
     CHECK(memcmp(id.internal, restored.internal, strlen(text) + 1) == 0, "id did not round-trip");
     CHECK(mcclUniqueIdFromString("not-an-id", &restored) == mcclInvalidArgument,

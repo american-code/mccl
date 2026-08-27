@@ -34,11 +34,33 @@ public struct DistributedOptions: Sendable {
     /// Print `MCCL_TOKEN=<text>` on stdout before anything else, for a launcher
     /// that scrapes it.
     public var emitToken = false
-    /// The local address to bind *and* advertise. Set this on a multi-homed
-    /// machine: without it a wildcard bind advertises whichever interface
-    /// `NetworkInterfaces.preferredLocalAddress()` likes, which may not be the
-    /// cable you meant to measure.
-    public var bindHost: String?
+    /// The local addresses to advertise, from `--bind`.
+    ///
+    /// Empty means auto-discovery: bind the wildcard and advertise every usable
+    /// local address, letting each *pair* of ranks pick its own best path. That
+    /// is the default now, and it is what makes a mixed fabric — a Thunderbolt
+    /// island plus a Wi-Fi bridge — form one world at all.
+    ///
+    /// One entry still pins the run to one cable, which is what a benchmark
+    /// that means to measure a specific link wants: the listener binds that
+    /// address and advertises nothing else, so no other path can be selected.
+    public var bindHosts: [String] = []
+
+    /// The single bind address, when exactly one was given. `nil` when the run
+    /// is auto-discovering or was given several — in both cases the listener
+    /// binds the wildcard and the advertisement carries the choice.
+    public var bindHost: String? {
+        get { bindHosts.count == 1 ? bindHosts[0] : nil }
+        set { bindHosts = newValue.map { [$0] } ?? [] }
+    }
+
+    /// What to advertise: every `--bind` entry, or nil for auto-discovery.
+    public var advertisedHosts: [String]? { bindHosts.isEmpty ? nil : bindHosts }
+
+    /// Human-readable summary of the address policy, for the run header.
+    public var bindSummary: String {
+        bindHosts.isEmpty ? "auto-discovered addresses" : bindHosts.joined(separator: ", ")
+    }
     /// Fixed rendezvous port for rank 0. 0 picks an ephemeral one.
     public var rendezvousPort = 0
     public var timeout: TimeInterval = 120
@@ -96,6 +118,7 @@ public enum DistributedBenchRunner {
         let comm = try Communicator.join(
             uniqueID: id, rank: distributed.rank, worldSize: distributed.worldSize,
             bindHost: distributed.bindHost ?? "0.0.0.0",
+            advertisedHosts: distributed.advertisedHosts,
             timeout: distributed.timeout)
         defer { comm.shutdown() }
 
@@ -153,7 +176,7 @@ public enum DistributedBenchRunner {
             let host = distributed.bindHost ?? "0.0.0.0"
             let id = try Rendezvous.createUniqueID(
                 host: host, port: distributed.rendezvousPort,
-                advertisedHost: distributed.bindHost)
+                advertisedHosts: distributed.advertisedHosts)
             if let path = distributed.tokenFile {
                 try Data((id.text + "\n").utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
             }

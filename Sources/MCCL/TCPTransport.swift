@@ -133,10 +133,12 @@ final class TCPChannel: Channel {
     let sendQueue: DispatchQueue
     let receiveQueue: DispatchQueue
     let peerDescription: String
+    let remoteAddress: PeerAddress?
 
     init(fd: Int32, peer: String) {
         self.fd = fd
         self.peerDescription = peer
+        self.remoteAddress = SocketSupport.peerAddress(fd: fd)
         self.sendQueue = DispatchQueue(label: "mccl.tcp.tx.\(fd)")
         self.receiveQueue = DispatchQueue(label: "mccl.tcp.rx.\(fd)")
     }
@@ -253,6 +255,33 @@ enum SocketSupport {
         }
         guard ok == 0 else { return "fd\(fd)" }
         return "\(String(cString: hostBuf)):\(String(cString: portBuf))"
+    }
+
+    /// The connected peer's address, numeric. Used to check a bootstrap
+    /// announcement against where it actually came from.
+    static func peerAddress(fd: Int32) -> PeerAddress? {
+        var storage = sockaddr_storage()
+        var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        let rc = withUnsafeMutablePointer(to: &storage) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                getpeername(fd, sa, &len)
+            }
+        }
+        guard rc == 0 else { return nil }
+        var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        var portBuf = [CChar](repeating: 0, count: Int(NI_MAXSERV))
+        let ok = withUnsafePointer(to: &storage) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                getnameinfo(sa, len, &hostBuf, socklen_t(hostBuf.count), &portBuf, socklen_t(portBuf.count),
+                            NI_NUMERICHOST | NI_NUMERICSERV)
+            }
+        }
+        guard ok == 0 else { return nil }
+        // "fe80::1%en0" -> "fe80::1"; the scope is local to the observer and
+        // would never match an advertised literal.
+        let host = String(cString: hostBuf).split(separator: "%").first.map(String.init) ?? ""
+        guard !host.isEmpty else { return nil }
+        return PeerAddress(host: host, port: Int(String(cString: portBuf)) ?? 0)
     }
 
     static func tune(fd: Int32, bufferBytes: Int) {

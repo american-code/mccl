@@ -52,6 +52,26 @@ public final class Communicator: @unchecked Sendable {
 
     // MARK: - Bring-up
 
+    /// Joins a world whose peers advertised `advertisements`. `listener` must
+    /// already be bound to this rank's own advertised port.
+    public static func bootstrap(
+        rank: Int,
+        worldSize: Int,
+        advertisements: [PeerAdvertisement],
+        listener: Listener,
+        transport: Transport = TCPTransport(),
+        topology: Topology? = nil,
+        timeout: TimeInterval = 30
+    ) throws -> Communicator {
+        let fabric = try MeshFabric.bootstrap(
+            rank: rank, worldSize: worldSize, advertisements: advertisements,
+            listener: listener, transport: transport, timeout: timeout)
+        return Communicator(
+            rank: rank, worldSize: worldSize,
+            topology: topology ?? Topology.uniform(nodeCount: worldSize),
+            fabric: fabric)
+    }
+
     /// Joins a world whose peers are reachable at `addresses`. `listener` must
     /// already be bound to `addresses[rank]`.
     public static func bootstrap(
@@ -63,13 +83,12 @@ public final class Communicator: @unchecked Sendable {
         topology: Topology? = nil,
         timeout: TimeInterval = 30
     ) throws -> Communicator {
-        let fabric = try MeshFabric.bootstrap(
-            rank: rank, worldSize: worldSize, addresses: addresses,
-            listener: listener, transport: transport, timeout: timeout)
-        return Communicator(
+        try bootstrap(
             rank: rank, worldSize: worldSize,
-            topology: topology ?? Topology.uniform(nodeCount: worldSize),
-            fabric: fabric)
+            advertisements: addresses.enumerated().map {
+                PeerAdvertisement(rank: $0.offset, address: $0.element)
+            },
+            listener: listener, transport: transport, topology: topology, timeout: timeout)
     }
 
     /// Brings up an entire world inside this process over real loopback TCP —

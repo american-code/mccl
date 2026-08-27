@@ -24,9 +24,64 @@ final class RendezvousTests: XCTestCase {
 
     func testMalformedTokensAreRejected() {
         for text in ["", "mccl1", "mccl1:zz:host:1", "mccl2:01:host:1",
-                     "mccl1:01:host:notaport", "mccl1:01::7000"] {
+                     "mccl1:01:host:notaport", "mccl1:01::7000",
+                     "mccl3:01:7000:host", "mccl2:01:7000:"] {
             XCTAssertNil(UniqueID(text: text), "'\(text)' should not parse")
         }
+    }
+
+    // MARK: - Multi-address tokens
+
+    func testOneHostStillProducesTheOriginalTokenFormat() {
+        // A single-homed cluster's tokens must be byte-identical to the ones
+        // mccl minted before per-pair addressing existed, or every launcher
+        // that pattern-matches on them breaks for no gain.
+        let id = UniqueID(nonce: 0xDEAD_BEEF_1234_5678, hosts: ["192.168.1.10"], port: 29500)
+        XCTAssertEqual(id.text, "mccl1:deadbeef12345678:192.168.1.10:29500")
+    }
+
+    func testSeveralHostsRoundTripThroughTheV2Token() {
+        let id = UniqueID(nonce: 0xDEAD_BEEF_1234_5678,
+                          hosts: ["169.254.152.222", "192.168.1.250"], port: 29500)
+        XCTAssertEqual(id.text,
+                       "mccl2:deadbeef12345678:29500:169.254.152.222|192.168.1.250")
+        XCTAssertEqual(UniqueID(text: id.text), id)
+        XCTAssertEqual(UniqueID(text: id.text)?.hosts,
+                       ["169.254.152.222", "192.168.1.250"],
+                       "rank 0's preference order survives the token")
+    }
+
+    func testAV2TokenCarriesIPv6HostsToo() {
+        // The port moves ahead of the hosts precisely so a v6 literal's colons
+        // stay unambiguous.
+        let id = UniqueID(nonce: 2, hosts: ["fe80::1c6f:911d", "10.0.0.1"], port: 7000)
+        let restored = UniqueID(text: id.text)
+        XCTAssertEqual(restored?.hosts, ["fe80::1c6f:911d", "10.0.0.1"])
+        XCTAssertEqual(restored?.port, 7000)
+    }
+
+    func testAV1TokenParsesIntoASingleAddressAdvertisement() {
+        let id = UniqueID(text: "mccl1:0000000000000001:10.0.0.4:9000")
+        XCTAssertEqual(id?.hosts, ["10.0.0.4"])
+        XCTAssertEqual(id?.advertisement.endpoints.count, 1)
+        XCTAssertEqual(id?.advertisement.rank, 0)
+    }
+
+    func testDuplicateHostsAreCollapsedAndAnEmptyListDegradesToLoopback() {
+        XCTAssertEqual(UniqueID(nonce: 1, hosts: ["10.0.0.1", "10.0.0.1"], port: 5).hosts,
+                       ["10.0.0.1"])
+        XCTAssertEqual(UniqueID(nonce: 1, hosts: [], port: 5).hosts, ["127.0.0.1"],
+                       "a token nothing can dial is worse than one pointing at this machine")
+    }
+
+    func testAMultiHostTokenStillFitsTheCABIsFixedBuffer() {
+        // MCCL_UNIQUE_ID_BYTES is 128 and the C shim copies the text into it.
+        // Four IPv4 addresses is more than any Mac in a lab has configured.
+        let id = UniqueID(nonce: .max,
+                          hosts: ["169.254.152.222", "192.168.100.250",
+                                  "10.211.55.2", "172.16.31.240"],
+                          port: 65535)
+        XCTAssertLessThan(id.text.utf8.count + 1, 128, id.text)
     }
 
     // MARK: - Address exchange
@@ -40,7 +95,7 @@ final class RendezvousTests: XCTestCase {
         for _ in 0..<worldSize { listeners.append(try transport.listen(host: "loopback", port: 0)) }
         defer { listeners.forEach { $0.close() } }
 
-        let tables = ResultSlots<[PeerAddress]>(count: worldSize)
+        let tables = ResultSlots<[PeerAdvertisement]>(count: worldSize)
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "rendezvous.test", attributes: .concurrent)
         for rank in 0..<worldSize {
@@ -60,7 +115,9 @@ final class RendezvousTests: XCTestCase {
         let collected = try tables.collect()
         let expected = listeners.map { PeerAddress(host: "loopback", port: $0.address.port) }
         for (rank, table) in collected.enumerated() {
-            XCTAssertEqual(table, expected, "rank \(rank) got a different world")
+            XCTAssertEqual(table.compactMap(\.primaryAddress), expected,
+                           "rank \(rank) got a different world")
+            XCTAssertEqual(table.map(\.rank), Array(0..<worldSize))
         }
     }
 
@@ -73,7 +130,7 @@ final class RendezvousTests: XCTestCase {
         let table = try Rendezvous.join(id: id, rank: 0, worldSize: 1,
                                         dataListener: listener, transport: transport)
         XCTAssertEqual(table.count, 1)
-        XCTAssertEqual(table[0].port, listener.address.port)
+        XCTAssertEqual(table[0].primaryAddress?.port, listener.address.port)
     }
 
     func testRankZeroTimesOutRatherThanHangingForeverOnAMissingRank() throws {

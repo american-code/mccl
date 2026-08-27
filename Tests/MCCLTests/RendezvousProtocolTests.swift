@@ -220,7 +220,7 @@ final class RendezvousProtocolTests: XCTestCase {
         for _ in 0..<worldSize { listeners.append(try TCPTransport().listen(host: "127.0.0.1", port: 0)) }
         defer { listeners.forEach { $0.close() } }
 
-        let tables = ResultSlots<[PeerAddress]>(count: worldSize)
+        let tables = ResultSlots<[PeerAdvertisement]>(count: worldSize)
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "rendezvous.rebind", attributes: .concurrent)
         for rank in 0..<worldSize {
@@ -239,7 +239,7 @@ final class RendezvousProtocolTests: XCTestCase {
 
         let collected = try tables.collect()
         XCTAssertEqual(collected[0], collected[1], "both ranks must agree on the world")
-        XCTAssertEqual(collected[0].map(\.port), listeners.map(\.address.port))
+        XCTAssertEqual(collected[0].compactMap(\.primaryAddress?.port), listeners.map(\.address.port))
     }
 
     // MARK: - Helpers

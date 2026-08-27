@@ -58,6 +58,19 @@ public protocol Channel: AnyObject {
     var receiveQueue: DispatchQueue { get }
 
     var peerDescription: String { get }
+
+    /// Where the peer dialed in from, when the transport can observe it.
+    ///
+    /// This is the only fact about a bootstrap handshake that the *announcing*
+    /// rank does not get to choose, so it is what makes the announcement
+    /// checkable: a rank claiming to be rank 3 has to be dialing from one of
+    /// the addresses rank 3 advertised. Nil for transports with no addressing
+    /// of their own, where the check is skipped rather than faked.
+    var remoteAddress: PeerAddress? { get }
+}
+
+extension Channel {
+    public var remoteAddress: PeerAddress? { nil }
 }
 
 /// Accepts inbound channels at a bound address.

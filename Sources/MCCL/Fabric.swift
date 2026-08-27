@@ -62,6 +62,63 @@ public final class MeshFabric: Fabric, @unchecked Sendable {
     /// Tag used for the one-frame rank handshake a dialer sends on connect.
     static let handshakeTag: UInt32 = 0xB007
 
+    /// How long one dial attempt gets before the next candidate is tried.
+    ///
+    /// Only relevant when a peer advertised more than one address. It has to be
+    /// short enough that three dead `169.254/16` addresses do not exhaust the
+    /// bring-up budget before the live one is reached, and long enough that a
+    /// working link is never abandoned mid-handshake. Each pass doubles it, so
+    /// a peer that is merely slow to bind is still found.
+    public static var dialAttemptSeconds: TimeInterval = 3
+
+    /// Opens a channel to one peer, choosing the path per pair.
+    ///
+    /// The order comes from `PathSelection.candidates`; the *decision* comes
+    /// from dialing them. On a link-local Thunderbolt fabric a subnet match
+    /// cannot distinguish three TB ports on one machine — they all carry
+    /// `169.254/16` — so the only honest test of which cable reaches this peer
+    /// is to open the socket and see.
+    public static func dial(
+        to advertisement: PeerAdvertisement,
+        own: PeerAdvertisement? = nil,
+        transport: Transport,
+        timeout: TimeInterval
+    ) throws -> Channel {
+        let candidates = PathSelection.candidates(for: advertisement, own: own)
+        guard let first = candidates.first else {
+            throw MCCLError.invalidArgument(
+                "rank \(advertisement.rank) advertised no address this rank can dial")
+        }
+        // One candidate is the old single-address bootstrap exactly: hand it
+        // the whole budget and let the transport do its own retrying.
+        guard candidates.count > 1 else {
+            return try transport.connect(to: first.endpoint.address, timeout: timeout)
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        var failures: [String] = []
+        var pass = 0
+        while true {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { break }
+            let attempt = min(dialAttemptSeconds * pow(2, Double(pass)), remaining)
+            failures.removeAll(keepingCapacity: true)
+            for candidate in candidates {
+                let slice = min(attempt, max(0, deadline.timeIntervalSinceNow))
+                guard slice > 0 else { break }
+                do {
+                    return try transport.connect(to: candidate.endpoint.address, timeout: slice)
+                } catch {
+                    failures.append("\(candidate) — \(error)")
+                }
+            }
+            pass += 1
+        }
+        throw MCCLError.timedOut(
+            "no path to rank \(advertisement.rank) in \(Int(timeout))s; tried "
+            + failures.joined(separator: "; "))
+    }
+
     /// Connects rank `rank` to every other rank.
     ///
     /// Ordering rule: for each pair (i, j) with i < j, the higher rank dials and
@@ -69,10 +126,14 @@ public final class MeshFabric: Fabric, @unchecked Sendable {
     /// rank calls this (see `makeGroup`), which is what keeps bring-up
     /// deadlock-free — a dial can land in the listen backlog before the peer
     /// reaches its accept loop.
+    ///
+    /// Each dial picks its own path out of the target's advertisement, so a
+    /// world spanning a Thunderbolt island and a Wi-Fi bridge forms one mesh
+    /// with each pair on the best cable the two of them share.
     public static func bootstrap(
         rank: Int,
         worldSize: Int,
-        addresses: [PeerAddress],
+        advertisements: [PeerAdvertisement],
         listener: Listener,
         transport: Transport,
         timeout: TimeInterval = 30
@@ -80,16 +141,23 @@ public final class MeshFabric: Fabric, @unchecked Sendable {
         guard rank >= 0, rank < worldSize else {
             throw MCCLError.rankOutOfRange(rank: rank, worldSize: worldSize)
         }
-        guard addresses.count == worldSize else {
-            throw MCCLError.invalidArgument("expected \(worldSize) peer addresses, got \(addresses.count)")
+        guard advertisements.count == worldSize else {
+            throw MCCLError.invalidArgument(
+                "expected \(worldSize) peer advertisements, got \(advertisements.count)")
         }
+        for (index, advertisement) in advertisements.enumerated() where advertisement.rank != index {
+            throw MCCLError.protocolViolation(
+                "advertisement at slot \(index) claims rank \(advertisement.rank)")
+        }
+        let own = advertisements[rank]
 
         var channels: [Int: Channel] = [:]
         let scratch = ScratchBuffer(capacity: WireHeader.byteCount)
 
         // Dial everyone below us.
         for peer in 0..<rank {
-            let channel = try transport.connect(to: addresses[peer], timeout: timeout)
+            let channel = try dial(to: advertisements[peer], own: own,
+                                   transport: transport, timeout: timeout)
             var header = WireHeader()
             header.tag = handshakeTag
             header.elementCount = UInt32(rank)
@@ -111,11 +179,37 @@ public final class MeshFabric: Fabric, @unchecked Sendable {
                 channel.close()
                 throw MCCLError.protocolViolation("bootstrap handshake announced impossible rank \(peer)")
             }
+            if advertisements[peer].disavows(source: channel.remoteAddress) {
+                let observed = channel.remoteAddress?.host ?? "?"
+                channel.close()
+                throw MCCLError.protocolViolation(
+                    "rank \(peer) announced itself from \(observed), which is not among the "
+                    + "addresses it advertised (\(advertisements[peer].hosts.joined(separator: ", ")))")
+            }
             channels[peer] = channel
         }
 
         return MeshFabric(rank: rank, worldSize: worldSize, channels: channels, listener: listener)
     }
+
+    /// Single-address bootstrap, unchanged for callers that know one address per
+    /// rank. Every address becomes a one-endpoint advertisement.
+    public static func bootstrap(
+        rank: Int,
+        worldSize: Int,
+        addresses: [PeerAddress],
+        listener: Listener,
+        transport: Transport,
+        timeout: TimeInterval = 30
+    ) throws -> MeshFabric {
+        try bootstrap(
+            rank: rank, worldSize: worldSize,
+            advertisements: addresses.enumerated().map {
+                PeerAdvertisement(rank: $0.offset, address: $0.element)
+            },
+            listener: listener, transport: transport, timeout: timeout)
+    }
+
 
     /// Brings up a whole world in this process: binds `worldSize` listeners on
     /// ephemeral ports, then bootstraps every rank concurrently.
