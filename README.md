@@ -6,6 +6,17 @@ MLX ships basic ring all-reduce over Thunderbolt/Ethernet, but there is no dedic
 collectives *library* for Mac clusters. mccl is that missing layer: infrastructure, not a
 training framework.
 
+**The thesis.** The job NCCL does on NVIDIA hardware had no incumbent on Apple silicon,
+so mccl fills it in NCCL's own idiom (`mccl.h`, `ncclComm_t`-shaped) and adds the axis
+NCCL has no equivalent of: in-band lossy compression with exactness bookkeeping, switched
+on by a measured rule — *a codec pays only when the fabric's uncompressed all-reduce rate
+is below that codec's own encode/decode ceiling* — which puts the advantage exactly where
+CUDA clusters are weakest, on commodity interconnects. The planner likewise solves the
+fabric from probed bandwidth and latency instead of assuming it. Where the CUDA stack is
+still ahead — RDMA fabrics, scale beyond the three nodes validated here, ecosystem
+maturity — is stated alongside the case, in
+[WHITEPAPER.md §3](docs/WHITEPAPER.md#3-value-proposition-competing-with-the-cuda-cluster-stack).
+
 ## What it does (design goals)
 
 - **Auto-tuned topology.** Measures actual TB5/USB4/Ethernet link bandwidth and latency

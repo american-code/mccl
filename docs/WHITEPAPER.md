@@ -5,8 +5,12 @@
 Small clusters of Apple Silicon machines have become a plausible substrate for
 distributed inference and fine-tuning, but they have no collectives library: MLX
 ships a built-in ring all-reduce, and everything else is written per-application.
-This paper describes mccl, an NCCL-shaped collectives library for such clusters,
-and argues three positions. First, that on a Mac cluster the interconnect rather
+This paper describes mccl, an NCCL-shaped collectives library for such clusters.
+It states a value thesis — that the layer NCCL occupies had no incumbent here,
+and that in-band compression governed by a measured crossover rule gives a Mac
+cluster its largest advantage on exactly the commodity interconnects where a CUDA
+cluster is weakest (§3, which states the boundary the other way too) — and argues
+three design positions. First, that on a Mac cluster the interconnect rather
 than the arithmetic is the binding constraint, so the library's job is to move
 fewer bytes rather than to reduce them faster. Second, that algorithm selection
 should be *solved* from measured bandwidth and latency rather than tuned against
@@ -83,9 +87,9 @@ the MLX framework, plus an MPI backend. It is what a Mac-cluster user reaches fo
 today, and it works. Its limitation is layering rather than quality: it is part
 of a framework, so a non-MLX runtime cannot use it, and it is a fixed ring, so it
 does not adapt to a measured fabric or a message size. mccl is positioned
-underneath rather than against it — the intended endpoint is an adapter that lets
-MLX hand mccl its arrays, and a head-to-head comparison. That adapter is not
-built (§6).
+underneath rather than against it: the adapter that lets MLX hand mccl its arrays
+exists (§6.1e), while the head-to-head against MLX's own ring is blocked
+upstream (§7).
 
 **exo** approaches a related problem from the other end: running large models
 across heterogeneous consumer devices by partitioning them according to each
@@ -96,14 +100,95 @@ competitor.
 Gradient compression has a substantial literature mccl draws on rather than
 extends: error feedback for sparsified SGD is what makes top-k converge instead
 of drift, and blockwise integer quantisation is standard. mccl's contribution is
-not the schemes but the argument in §3.4 about *where in the collective* they may
+not the schemes but the argument in §4.4 about *where in the collective* they may
 be applied.
 
 ---
 
-## 3. Design
+## 3. Value proposition: competing with the CUDA cluster stack
 
-### 3.1 A measured-topology planner
+This section states the case for using mccl rather than the design behind it;
+every figure in it is measured in §6 or in [COMPARISON.md](COMPARISON.md).
+
+**There was no incumbent to displace.** The job NCCL does on NVIDIA hardware is
+done on Apple silicon by nothing: MLX's ring lives inside a framework and is
+reachable only from that framework, and every other runtime writes its own or does
+not distribute (§2). mccl is not a faster alternative to an existing library, it is
+the missing layer — and it is deliberately in NCCL's idiom, so the cost of trying
+it is low. `mccl.h` mirrors `ncclComm_t`, `ncclUniqueId`, the collective signatures
+argument for argument, and bus bandwidth as the reporting metric; a runtime that
+already speaks NCCL needs renaming and little else. The one departure is an ABI
+fix — the 128-byte unique id crosses by pointer, for portability across the
+architectures a mixed cluster can contain — hidden behind a `static inline`
+wrapper that restores NCCL's own spelling (§5).
+
+**The capability edge is in-band compression, which NCCL does not have at all.**
+NCCL moves the bytes the caller handed it, because on NVLink the wire is not the
+constraint. On a Mac cluster it is, so mccl spends arithmetic to buy wire, with the
+exactness bookkeeping that makes it safe to leave on: a codec that cannot help a
+dtype degrades to raw rather than quantising an integer accumulator,
+and top-k is refused as a per-hop codec and routed to a sparsify-once all-gather
+whose reduction is exact given the sparsification, with the residual exposed as
+model state (§4.3, §4.4). Whether to switch it on is not a matter of taste: *a
+codec pays only when the fabric's uncompressed all-reduce rate is below that
+codec's own encode/decode ceiling* — both sides measurable with `mcclbench` and
+`mcclbench --codec-bench`, and confirmed from both directions in §6.1b: lifting
+two ceilings above the cable's rate flipped both codecs from loss to win, and the
+third, whose ceiling stayed below, stayed a loss.
+
+**That is why Mac clusters win hardest where CUDA clusters are weakest.** NCCL's
+efficiency is a function of the fabric it is given, and without RDMA it collapses
+by 5–20× onto TCP sockets. mccl's compression is worth the most in exactly that
+regime. On the Wi-Fi path between the two lab machines — 0.052 GB/s uncompressed,
+a commodity-interconnect proxy — `topk/0.01` returns 5.4× at 16 MiB, and with
+vectorised encoders the other two collect essentially their full wire reduction
+(downcast 1.99× of a possible 2.00×, int8 3.88× of 3.94×). On the Thunderbolt
+cable, once the encoders clear the cable's rate, `downcast` returns 1.07–1.53× and
+`int8/256` 1.27–1.71×. The slower and commoner the link, the more the library has
+to offer — the opposite of the shape of NCCL's curve.
+
+**The planner measures the fabric instead of assuming it.** There is no NVLink
+enumeration to read on a Mac, so mccl probes pairwise bandwidth and minimum
+latency and solves ring order, tree root and the ring/tree crossover from them
+(§4.1). At n = 3 that selection has hardware evidence — tree wins by 1.87×, 1.58×,
+1.17× while the collective is latency-bound and ring wins by 1.32×, 1.03×, 1.26×
+once it is bandwidth-bound (§6.1d) — with the honest caveat
+that the closed-form threshold locates the crossover 4–13× low on a fabric whose
+bandwidth is not constant in message size.
+
+**The economic frame follows from the hardware, not from a benchmark.** NVIDIA's
+cluster story prices in the fabric: NVLink domains and InfiniBand are capital
+expenditure before the first collective runs. The Mac story is the cables already
+in the room, plus unified memory per dollar — capacity addressable by CPU and GPU
+without a copy, which is why the MLX adapter hands mccl the same pointer the GPU
+reads and no host/device staging occurs anywhere (§6.1e). No price numbers are
+attached here: the claim is about which costs exist, not about their size.
+
+**It is demonstrated on a real workload, including where it loses.** The MLX
+adapter trains an MLP data-parallel across two machines. Correctness is an
+equivalence, not a tolerance: over 200 steps the two-rank loss trajectory
+reproduces a single process on the combined batch to 3.6e-05 across the
+Thunderbolt cable. Throughput is honest in both directions — two machines lose at
+batch 256, break even between 1,024 and 4,096, and reach 1.45× of a 2.0× ceiling
+at 16,384 (§6.1e).
+
+**Where the CUDA stack remains ahead.** Three places, and they are not small.
+*Fabric:* mccl is TCP/IP only. Thunderbolt is reached as IP over the TB bridge and
+gives up roughly 58% of line rate to the stack before mccl runs, so against the
+raw line mccl's 25–30% sits below NCCL-over-TCP's published 32–48%, and an
+RDMA-class fabric is out of reach entirely until the bulk-DMA transport of §7
+exists. *Scale:* the planner is validated at n = 3 and the hierarchical plan that
+motivates island detection is untested, since it needs two islands of two ranks;
+nothing here says what happens at 16 nodes. *Maturity:* NCCL is production
+infrastructure every framework already targets, with asynchronous stream semantics
+mccl's blocking v0 does not offer, and the head-to-head against MLX's own ring
+that would settle the Mac-side comparison is blocked upstream (§7).
+
+---
+
+## 4. Design
+
+### 4.1 A measured-topology planner
 
 mccl plans over measurements, not assumptions. `mcclprobe serve` runs on each
 node; `mcclprobe measure` drives real transfers and produces a `Topology` of
@@ -139,7 +224,7 @@ a ring. Below `S*` the planner picks tree; above it, ring.
 Stating this in closed form removes the tuning knob.
 `TopologyPlanner.crossoverBytes` is exactly this expression, and it is the only
 size threshold anywhere in mccl's algorithm selection — there is no byte constant
-to go stale when the fabric changes. On the Thunderbolt fabric of §5.1 it
+to go stale when the fabric changes. On the Thunderbolt fabric of §6.1 it
 evaluates to 0 bytes at n = 2, 139.0 KiB at n = 4 and 623.9 KiB at n = 16; on a
 slower fabric it moves up, on a faster one down, and nothing is re-tuned.
 
@@ -147,7 +232,7 @@ Two smaller decisions fall out of the same measurements: the ring *order* is a
 greedy maximum-bandwidth walk over the measured links rather than rank order, and
 the tree *root* is the rank with the greatest total measured bandwidth.
 
-### 3.2 Ratio-gap island detection
+### 4.2 Ratio-gap island detection
 
 A mixed-speed fabric — Thunderbolt pairs bridged by Ethernet or Wi-Fi — wants
 neither a flat ring nor a flat tree, since a flat ring routes the whole ring's
@@ -164,13 +249,13 @@ pair, and takes connected components of the edges above the cut — after gating
 the fastest link being at least 3× the slowest.
 
 The 3× gate and the ratio-gap search do different jobs, and the distinction
-produced a result we did not anticipate. In the four-node loopback map of §5.4
+produced a result we did not anticipate. In the four-node loopback map of §6.4
 the overall spread is 3.74×, which passes the gate — but the largest adjacent
 ratio gap is only 1.84×, so mccl reports a single uniform, noisy fabric rather
 than inventing a hierarchy. That is the desired behaviour: overall spread is
 necessary for a mixed fabric but not sufficient, and a genuinely bimodal fabric
 shows up as a *gap*, not a range. On a map of two Thunderbolt pairs bridged by
-Wi-Fi at the ratios measured in §5.1 (10.50×), island detection recovers
+Wi-Fi at the ratios measured in §6.1 (10.50×), island detection recovers
 `[[0,1],[2,3]]` and the planner produces a hierarchical plan at 64 MiB and a
 plain tree at 1 KiB.
 
@@ -183,7 +268,7 @@ it. What the interface buys is honesty in the operator-facing output: a congeste
 Thunderbolt bridge measuring 900 MB/s is still Thunderbolt, and fast Wi-Fi is
 never a cable.
 
-### 3.3 Per-hop wire compression
+### 4.3 Per-hop wire compression
 
 Compression is applied per hop and never changes the dtype the caller sees. The
 codec id travels in the frame header, so a receiver always decodes with the
@@ -205,7 +290,7 @@ A scheme that cannot help a given dtype degrades to raw rather than erroring:
 would be wrong rather than merely lossy. Compression is thus a hint the library
 may decline, so a caller can set one policy across a mixed-dtype model.
 
-### 3.4 Why top-k is an algorithm, not a codec
+### 4.4 Why top-k is an algorithm, not a codec
 
 The most consequential position in mccl is that top-k sparsification is not
 admissible as a per-hop wire codec and must instead replace the collective's
@@ -252,7 +337,7 @@ gradient.
 
 ---
 
-## 4. Implementation
+## 5. Implementation
 
 mccl is 3,982 lines of Swift in the core library, 796 in the C shim and its
 hand-written header, and 926 in the benchmark harness and two CLIs, with **no
@@ -300,9 +385,9 @@ caller and a Swift caller cannot disagree about what is in a frame.
 
 ---
 
-## 5. Evaluation
+## 6. Evaluation
 
-### 5.1 First real-hardware validation
+### 6.1 First real-hardware validation
 
 The first measurement of mccl on real cluster hardware: two Mac Studio M1 Max
 machines connected by a direct Thunderbolt cable, negotiated at 20 Gb/s, probed
@@ -321,7 +406,7 @@ reported for NCCL over TCP sockets — the right comparison, since mccl reaches
 Thunderbolt as IP over the TB bridge and pays the same stack costs. That is
 evidence the methodology is sound and the framing layer has no gross
 inefficiency, and simultaneously the strongest available argument for the
-bulk-DMA transport of §6: roughly 58% of the link is lost to a protocol stack a
+bulk-DMA transport of §7: roughly 58% of the link is lost to a protocol stack a
 direct transport would not traverse.
 
 **Interface-based link classification works.** The two paths between the same
@@ -334,20 +419,19 @@ trustworthy.
 
 **The measured spread is what the mixed-fabric machinery is for.** The two paths
 differ by 10.5× in bandwidth and 15.6× in latency: far past the 3× gate, and a
-real instance of the bimodal fabric of §3.2 rather than a synthetic one.
+real instance of the bimodal fabric of §4.2 rather than a synthetic one.
 
 **What it does not establish:** ring versus tree versus hierarchical, which needs
 four or more machines. Two machines exercise the probe, the classifier and the
 planner's degenerate case.
 
-Collective throughput, which this section originally could not establish, is
-measured in §5.1a.
+Collective throughput on this link is measured in §6.1a.
 
-### 5.1a Collective throughput on the Thunderbolt cable
+### 6.1a Collective throughput on the Thunderbolt cable
 
 `mcclbench` now runs distributed — one process per machine, joining through the
 same `Rendezvous` token the C shim uses — so the same sweep that ran over
-loopback runs over the cable of §5.1. Rank 0 on `studio-a` bound to
+loopback runs over the cable of §6.1. Rank 0 on `studio-a` bound to
 `169.254.152.222`, rank 1 on `studio-b` bound to `169.254.23.203`, all-reduce fp32
 sum, ring, best of five sweeps. Bus bandwidth in GB/s; with n = 2 the bus factor
 is 1, and the parenthesised figure is the fraction of the 1.06 GB/s probed link.
@@ -366,14 +450,14 @@ measures a one-directional stream; an all-reduce reduces every byte it receives
 and turns the link around twice, so 70% is evidence that neither the framing nor
 the ring schedule is where the time goes.
 
-**The codec verdict, which §5.3 left open, goes against the codecs.** §5.3 called
+**The codec verdict, which §6.3 left open, goes against the codecs.** §6.3 called
 it "an arithmetic question only the cluster can settle". The cluster has settled
 it: on a 1.06 GB/s Thunderbolt link every codec loses above 256 KiB. `downcast`
 puts exactly half as many bytes on the wire — verified at `studio-a`'s `en4` byte
 counter, 168.1 MB against 336.1 MB over five 64 MiB collectives, with `int8/256`
 at 3.94× and `topk/0.01` at 49.9× reduction — and is still 25–32% slower.
 
-This is not the direction §5.3's loopback table pointed. There `downcast` cost
+This is not the direction §6.3's loopback table pointed. There `downcast` cost
 nothing measurable (1.209 against 1.195 GB/s bus at 16 MiB, inside the noise),
 which made halving the wire bytes look like a free win waiting for a slow enough
 link. On the cable it is not free at all.
@@ -399,7 +483,7 @@ because at that rate the encode is entirely hidden behind the transfer:
 | 16 MiB | 0.054 | 0.103 (1.91×) | 0.126 (2.33×) | **0.295 (5.44×)** |
 | 64 MiB | 0.052 | 0.099 (1.89×) | 0.110 (2.11×) | **0.256 (4.90×)** |
 
-Two consequences. First, §3.3 treats compression as a caller's flag; it should be
+Two consequences. First, §4.3 treats compression as a caller's flag; it should be
 a planned decision. The planner already measures link bandwidth, and a codec's
 ceiling is a local-machine property that could be calibrated once the way the
 probe calibrates a cable. Second, the ceilings are an artefact of scalar Swift,
@@ -408,7 +492,7 @@ be a handful of vector instructions. Vectorising the codecs is the single change
 that would flip this verdict on Thunderbolt, and this table is the argument for
 making it.
 
-§5.1b takes that prediction and runs it.
+§6.1b takes that prediction and runs it.
 
 One expectation also failed. With n = 2 the ring and the binomial tree move the
 same total bytes, and were expected to be equivalent; they are not. Over four
@@ -425,7 +509,7 @@ is close to definitional once both schedules are written out. Its value is as a
 correction to the naive expectation of a tie, nothing more. The plans that
 motivate having a planner at all — the tree's `O(log n)` dependent hops, the
 hierarchical plan's single crossing of a slow bridge — cannot pay at n = 2 and
-only begin to at n ≥ 4. **§3.2's planner is therefore unvalidated on hardware,
+only begin to at n ≥ 4. **§4.2's planner is therefore unvalidated on hardware,
 and stays that way until a 3+ node run.** That, not another 2-node sweep, is the
 experiment that would test it.
 
@@ -438,24 +522,24 @@ per point is the slowest rank's, agreed with a one-element max all-reduce; a
 barrier separates each point's warm-up from its timed region. Full tables in
 [ARCHITECTURE.md § Measured: 2-node Thunderbolt](ARCHITECTURE.md#measured-2-node-thunderbolt).
 
-### 5.1b Vectorising the codecs, and testing the prediction it was made to test
+### 6.1b Vectorising the codecs, and testing the prediction it was made to test
 
-§5.1a ends with a falsifiable claim: the codecs lose on Thunderbolt because their
+§6.1a ends with a falsifiable claim: the codecs lose on Thunderbolt because their
 scalar encode/decode ceilings sit below what the cable delivers, so lifting a
 codec's ceiling above that rate should flip it to a win. This section reports the
 experiment. The change under test is `CodecKernels`, a vector implementation of
 the same wire formats — byte-for-byte the same frames, checked in both directions
-against a copy of the original scalar loops (§5.2).
+against a copy of the original scalar loops (§6.2).
 
-**Measuring the ceiling instead of inferring it.** The ceilings in §5.1a were read
+**Measuring the ceiling instead of inferring it.** The ceilings in §6.1a were read
 off the plateau of a distributed sweep, which conflates the codec with everything
 else in a compressed call. `mcclbench --codec-bench` now measures the kernels
 directly, in payload GB/s, through the same code path a ring step runs. The first
-result is a correction to §5.1a: the scalar `downcast` kernel on an *idle* M1 Max
+result is a correction to §6.1a: the scalar `downcast` kernel on an *idle* M1 Max
 runs at 3.67 GB/s round-trip, five times the cable, not 0.50. The low figures
 belong to `studio-a`, which shares its machine with an inference workload and, as
 the slower rank, sets the reported time. Its scalar ceilings are 0.89 (downcast),
-0.21 (int8/256), 0.19 (topk/0.01) GB/s — and the compressed plateaus of §5.1a
+0.21 (int8/256), 0.19 (topk/0.01) GB/s — and the compressed plateaus of §6.1a
 land at ~56% of those, the remainder being sockets, framing and reduction. The
 rule was right; the constants attached to it were a property of one busy node.
 
@@ -512,9 +596,9 @@ per codec moved 336.3 / 168.1 / 85.3 / 6.7 MB across `studio-a`'s `en4` counters
 under the vectorised build, against 336.1 / 168.1 / 85.3 / 6.7 MB under the
 scalar one.
 
-### 5.1c Reduction kernels: the same lesson, applied a second time
+### 6.1c Reduction kernels: the same lesson, applied a second time
 
-§5.1b's finding was not "SIMD is faster". It was that *a loop whose body switches
+§6.1b's finding was not "SIMD is faster". It was that *a loop whose body switches
 on a runtime value cannot be vectorised*, and that on this code the penalty was an
 order of magnitude. That is a claim about a pattern, so it predicts where else the
 pattern will be found.
@@ -552,16 +636,16 @@ nothing measurable, and it was reverted to the plain loop with the measurement r
 in the source so it is not "optimised" again. And bf16's round-to-nearest-even store
 has a NaN branch, so it stays scalar and gains only from the hoist.
 
-The collective-level value is smaller than §5.1b's, and predictably: reduction runs
+The collective-level value is smaller than §6.1b's, and predictably: reduction runs
 once per received chunk against a codec's twice per call, so on a 1.06 GB/s cable a
 16.9 GB/s kernel was already only ~6% of the wall clock. It matters where the fabric is
 not the bottleneck — in-process and loopback worlds, a future bulk-DMA transport, and
 top-k's accumulation of gathered blocks.
 
-### 5.1d Topology selection at n = 3
+### 6.1d Topology selection at n = 3
 
 Every measurement to this point is n = 2, where the ring degenerates to a single
-full-duplex point-to-point exchange and the tree has nothing to be a tree about. §3.1's
+full-duplex point-to-point exchange and the tree has nothing to be a tree about. §4.1's
 claim — that the algorithm should be *solved* from measured α and B — says nothing
 testable until three ranks. Three ranks, two M1 Max and an M1 Pro, over Wi-Fi (the only
 fabric reaching all three), fp32 sum all-reduce:
@@ -581,12 +665,12 @@ its `2(n−1)/n` bytes per link against the tree's `2N` through the root. The tr
 margin decays monotonically (1.87× → 1.58× → 1.17×) before it flips, which is the shape
 the model predicts rather than two endpoints that happen to differ.
 
-**The quantitative claim does not.** `S*` from §3.1, fed this fabric's probed α and B,
+**The quantitative claim does not.** `S*` from §4.1, fed this fabric's probed α and B,
 predicts ~75 KB. The measured crossover is between 256 KiB and 1 MiB, so the formula is
 low by roughly 4–13×. The reason is visible in the sweep: the derivation assumes a single
 bandwidth `B`, and this fabric's effective bandwidth climbs from 0.001 GB/s at 16 KiB to
 0.021 GB/s at 16 MiB. A threshold solved from one `B` cannot be right at both ends of a
-twentyfold range. §3.1's stronger framing — that solving beats tuning — survives as far
+twentyfold range. §4.1's stronger framing — that solving beats tuning — survives as far
 as *which* algorithm to pick and fails as far as *where* to switch; a size-dependent
 bandwidth model is the obvious repair and is not attempted here.
 
@@ -595,7 +679,7 @@ two ranks. A uniform three-rank fabric has none, and the sweep correctly produce
 hierarchical rows for it — though it did so silently, which was a reporting bug and is
 now a printed line (`BenchAlgorithm.inapplicabilityReason(worldSize:)`).
 
-### 5.1e An MLX adapter, and data-parallel training that is honestly slower
+### 6.1e An MLX adapter, and data-parallel training that is honestly slower
 
 `MCCLMLX` is a separate target with the package's only external dependency, so `MCCL`
 stays linkable by a runtime that has never heard of MLX. It extends `Communicator` with
@@ -656,7 +740,7 @@ mccl is the one the GPU reads, so no host/device staging occurs anywhere — the
 CUDA equivalent could not have.
 
 
-### 5.2 Correctness
+### 6.2 Correctness
 
 The test suite is 273 tests across 21 suites, all passing, run with
 `swift test`. They are split across two test targets: 239 tests exercise the core
@@ -716,7 +800,7 @@ behaviourally through other paths. What remains uncovered is dominated by
 defensive code unreachable without injecting faults into libc — `EINTR` retry
 loops, `socket()` returning a negative descriptor — which we did not chase.
 
-### 5.3 Loopback benchmarks, and what they measure
+### 6.3 Loopback benchmarks, and what they measure
 
 `mcclbench` sweeps message size × algorithm × codec over N ranks in one process,
 bringing one world up for the whole sweep and pinning the plan per point, so the
@@ -749,7 +833,7 @@ be across four machines.
 
 **The codec columns are a cost measurement, not a verdict.** Over loopback there
 is no wire: the "interconnect" is memory bandwidth, an order of magnitude faster
-than the Thunderbolt link of §5.1. Every codec pays its full encode cost and buys
+than the Thunderbolt link of §6.1. Every codec pays its full encode cost and buys
 back nothing, so `int8/256` duly comes last at 0.491 GB/s bus against `none` at
 1.195. What the table gives is each codec's CPU price per byte, the input needed
 to predict where a codec starts *winning* on a slower link. `downcast` halves the
@@ -765,29 +849,29 @@ scratch exceeds what a 16 GB machine keeps resident, so that is memory pressure
 on the test host rather than a property of the collective; the 64 MiB row should
 not be used for anything.
 
-### 5.4 Probe measurements over loopback
+### 6.4 Probe measurements over loopback
 
 Three `mcclprobe serve` processes on one machine, measured pairwise, produce a
 genuinely asymmetric four-node map (1.32–4.93 GB/s, RTTs 12.8–69.4 µs) from which
 the planner derives a 71.5 KiB crossover, a ring order of `0→1→3→2` rather than
 rank order, and a tree rooted at rank 3 rather than rank 0. The 3.74× spread with
-a 1.84× maximum ratio gap is the "noisy single fabric" case of §3.2. These
+a 1.84× maximum ratio gap is the "noisy single fabric" case of §4.2. These
 numbers say nothing about real link speeds; what they establish is that pairwise
 measurement, JSON persistence and plan derivation work end to end on data the
 library did not generate synthetically.
 
 ---
 
-## 6. Limitations and future work
+## 7. Limitations and future work
 
-**Evaluation reaches three machines, not four.** §5.1d gives the planner its first
+**Evaluation reaches three machines, not four.** §6.1d gives the planner its first
 real test and it passes qualitatively — tree below the crossover, ring above — but
 two gaps remain. The closed-form threshold is 4–13× low on a fabric whose
-bandwidth varies with message size, so §3.1's "solved, not tuned" holds for
+bandwidth varies with message size, so §4.1's "solved, not tuned" holds for
 *which* algorithm and not for *where* to switch. And the hierarchical plan is
 still untested: it needs at least two islands of two ranks, which means four
 machines on a mixed Thunderbolt/Ethernet fabric. That remains the experiment that
-would validate §3.2, and `mcclbench` in distributed mode is the harness ready to
+would validate §4.2, and `mcclbench` in distributed mode is the harness ready to
 run it.
 
 **No same-language head-to-head against MLX's ring, and the obstacle is upstream.**
@@ -804,7 +888,7 @@ needs mlx-swift to expose `mlx::distributed`, or a build of it with those source
 restored.
 
 **No Thunderbolt-specific transport.** Thunderbolt is reached as ordinary IP over
-the TB bridge, and the 42.4% of line rate in §5.1 is the direct cost. A bulk-DMA
+the TB bridge, and the 42.4% of line rate in §6.1 is the direct cost. A bulk-DMA
 transport implementing `listen`/`connect` would leave everything above it
 unchanged, and is the largest identified performance opportunity in the system.
 
@@ -815,10 +899,10 @@ additive; membership change and reconnection would reach into the collectives.
 
 **The C calls all block.** A genuine `mcclStream_t` execution context with
 `mcclGroupStart`/`mcclGroupEnd` batching waits on there being a device queue
-worth enqueueing onto. (The reduction kernels are no longer a limitation: §5.1c
+worth enqueueing onto. (The reduction kernels are no longer a limitation: §6.1c
 applies the same fix the codecs got, for the same reason, at 4.4–5.1× on fp32.)
 
-**Compression is still a caller's flag, and should not be.** §5.1b leaves the
+**Compression is still a caller's flag, and should not be.** §6.1b leaves the
 library in a state where two codecs win on Thunderbolt and one loses, which is a
 decision the planner has the data to make and the caller usually does not: the
 probe measures the fabric, `mcclbench --codec-bench` measures the machine, and
@@ -836,7 +920,7 @@ it is a side effect of building the library rather than a goal of it.
 
 ---
 
-## 7. Conclusion
+## 8. Conclusion
 
 Mac clusters lack a collectives library, and the absence matters more than it
 would elsewhere, because the thing that limits them — the interconnect — is
@@ -853,7 +937,7 @@ harness, an MLX adapter and a data-parallel training demo — 273 tests at 90.56
 region coverage, and no external dependencies outside the MLX target. The
 first real-hardware measurement puts a direct Thunderbolt link at 1.06 GB/s and
 167.8 µs, 42.4% of its negotiated line rate, with both paths between the machines
-correctly classified. On that link the compression rule of §5.1a has now been
+correctly classified. On that link the compression rule of §6.1a has now been
 tested rather than merely stated: vectorising the encoders lifted two codecs'
 ceilings above the fabric's rate and both flipped from losing to winning, while
 the third stayed below it and stayed a loss.
@@ -871,7 +955,7 @@ machine starts paying measured rather than assumed.
 What is still not established is the claim the design rests on: that a
 measured-topology planner with wire compression beats a fixed ring on a real
 *mixed-speed* cluster. That needs four or more machines with two fast islands, and
-it is the only remaining experiment that would test §3.2 at all. The head-to-head
+it is the only remaining experiment that would test §4.2 at all. The head-to-head
 against MLX's own ring, meanwhile, is blocked upstream rather than here:
 mlx-swift does not build MLX's distributed backends and exposes no distributed
 API, so there is currently nothing to compare against in the same language.

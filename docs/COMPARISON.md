@@ -120,7 +120,8 @@ Still untested: the hierarchical plan, which needs at least two islands of two r
 so n ≥ 4, and the mixed-speed fabric island detection exists for.
 
 Full tables and method notes: [ARCHITECTURE.md](ARCHITECTURE.md) §Measured,
-[WHITEPAPER.md](WHITEPAPER.md) §5.
+[WHITEPAPER.md](WHITEPAPER.md) §6; the value thesis this comparison feeds is
+[WHITEPAPER.md §3](WHITEPAPER.md#3-value-proposition-competing-with-the-cuda-cluster-stack).
 
 
 ## The comparison that cannot be run
