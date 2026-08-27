@@ -167,12 +167,26 @@ mcclResult_t mcclAllReduce(const void* send, void* recv, size_t count,
 
 Three places where mccl differs from NCCL, and why:
 
-- **Blocking.** NCCL enqueues onto a CUDA stream and returns; mccl v0 has no device
-  queue to enqueue onto, so every call runs the collective to completion (dispatch
-  semaphore over the async Swift API) and returns when the buffers are safe to touch.
+- **The plain calls block; asynchrony is a separate entry point.** NCCL's asynchrony is
+  the CUDA stream's: `ncclAllReduce` enqueues onto a stream the caller already owns, and
+  the caller synchronises that stream. mccl has no device queue to borrow, so it takes
+  MPI's shape instead — `mcclAllReduceAsync` returns an `mcclRequest_t`,
+  `mcclRequestWait` blocks and frees it, `mcclRequestTest` asks without blocking.
+  `mcclAllReduce` still runs to completion and still means what it always meant, which
+  for a library whose stated priority is a stable C ABI is the part that matters.
+
+  Two things about the overlap are worth stating exactly, because it is easy to imply
+  more. Collectives on one communicator run on its serial queue and the enqueue happens
+  synchronously at issue, so several outstanding requests execute *in issue order*. That
+  is required, not a limitation: ranks must run collectives in the same order or they
+  deadlock, and issue order is the only order every rank agrees on. And what overlaps is
+  the caller's own work with the collective's socket traffic — not two collectives with
+  each other.
 - **`mcclStream_t` is not an execution context.** It names an independent *sequence* of
   collectives, which matters only to top-k's per-stream residual. `mcclStreamFromId`
-  builds one from an integer.
+  builds one from an integer. Making it the thing you wait on would have given one handle
+  two jobs and silently turned every existing blocking call non-blocking, so the request
+  handle is a new type rather than a new meaning for an old one.
 - **`mcclCommInitRank` is a `static inline` over `mcclCommInitRankFromId`.** The
   by-value 128-byte `mcclUniqueId` in NCCL's signature has a different ABI on arm64 and
   x86_64; the exported symbol takes the token by pointer, and the header restores the
@@ -189,7 +203,10 @@ it chose).
 `Tests/MCCLTests/CProgram/mccl_smoke.c` is a complete four-rank client; `CShimTests`
 compiles it with `cc` against the built dylib and runs it, which is the only check that
 proves at once that the header is valid C, that its declarations match the exported
-symbols, and that a non-Swift process can link the library.
+symbols, and that a non-Swift process can link the library. It issues four asynchronous
+all-reduces before waiting on any of them, each with a different multiplier, so a request
+completing against the wrong buffer — or two ranks disagreeing about issue order — is a
+wrong sum rather than a silent pass.
 
 ## MLX adapter
 
@@ -290,7 +307,7 @@ the `mlx-metal` pip wheel and installs it beside the running binary, where MLX's
 hit this first.
 
 Two consequences for the test suite. `MCCLMLXTests` is a **separate test target** so that
-the core library's 239 tests never acquire an MLX dependency and keep running on a
+the core library's 275 tests never acquire an MLX dependency and keep running on a
 machine with no metallib. And every test that touches MLX checks for the library first and skips
 with the fix, because a fatal error cannot be turned into a test failure.
 
@@ -303,17 +320,108 @@ is launched. The C ABI cannot: `mcclCommInitRank` gets one token and nothing els
 
 1. Every rank binds its own data listener first, so no dial can arrive before its target
    is accepting.
-2. Ranks 1…n-1 connect to the token's address and announce `(rank, data address)`.
+2. Ranks 1…n-1 connect to the token's address and announce `(rank, every address they
+   can be reached at)`.
 3. Rank 0 waits for all n-1 announcements, then sends the assembled table back down the
    same connections.
 
-The token is printable text — `mccl1:<nonce>:<host>:<port>` — precisely so it can travel
-through a shell, a job script or an env var. The nonce keeps two concurrent jobs on one
-host apart.
+The token is printable text precisely so it can travel through a shell, a job script or
+an env var. The nonce keeps two concurrent jobs on one host apart.
 
 What this is **not** is a rendezvous *service*: no discovery, no membership change, no
 recovery from a rank restarting. Rank 0 must be up, and `mcclGetUniqueId` must be called
 in the process that will host rank 0.
+
+## Per-pair addressing
+
+`MeshFabric` used to carry one `PeerAddress` per rank. That is enough for a uniform
+fabric and wrong for every interesting one. A world spanning a Thunderbolt island and a
+Wi-Fi bridge has *no single address per rank that all of its peers can dial*: the studio
+next to you is on `169.254/16` and the laptop across the room is on `192.168.1/24`, and a
+rank that advertises one of them is unreachable from the other side.
+
+So each rank advertises all of them, and each **pair** picks its own path.
+
+### What is advertised
+
+`PeerAdvertisement.local` walks the interface table (§Probe already classifies media) and
+takes every IPv4 address on an interface that is up and not loopback, ordered
+thunderbolt → ethernet → wifi → other. A `169.254/16` address counts only on
+Thunderbolt, where a point-to-point bridge with no DHCP server is the normal case; on any
+other media it means the interface failed to configure. IPv4 only, deliberately: IPv6
+privacy addresses rotate, and an advertisement whose entries expire is worse than one
+that is merely incomplete.
+
+Each entry carries the media tag the *advertiser* believes it sits on. That tag is
+advisory and never load-bearing — see below.
+
+### The selection rule
+
+`PathSelection.candidates` orders a peer's endpoints from the dialer's point of view:
+
+1. For each advertised endpoint, find the **local egress interface** — the local
+   interface whose subnet contains that address, longest prefix first. The path's kind is
+   *that interface's* media. An endpoint no local subnet matches is `unroutable`: still
+   dialable through the default route, but ranked last, because nothing here can say what
+   it would cross.
+2. Sort by kind priority: `loopback > thunderbolt > ethernet > wifi > other > unroutable`.
+3. Break ties on the advertiser's own media tag, in the same order, then on the
+   endpoint's position in the advertisement. Both tiebreaks are pure functions of the
+   advertisement, so every rank derives the same order for it.
+4. Drop loopback candidates unless the dialer itself has nothing but loopback to offer.
+   `127.0.0.1` in a remote peer's advertisement names the *dialer's* machine.
+
+Rule 1 is the load-bearing one, and it is why the advertiser's tag cannot promote a path:
+what matters is the cable the bytes leave on, which the dialer can observe, not the
+hardware the peer claims to own, which it cannot.
+
+**Order alone is not enough, so the order is resolved by dialing it.** Three Thunderbolt
+ports on one machine all carry `169.254/16` addresses — lab-01 has exactly three — and a
+/16 subnet match cannot say which of them has the cable that reaches *this* peer.
+`MeshFabric.dial` walks the ordered list with a short per-attempt timeout and takes the
+first connection that completes, doubling the timeout each pass so a peer that is merely
+slow to bind is still found. Reachability is measured, not inferred, which is the same
+stance the planner takes towards bandwidth.
+
+That made a latent bug matter: `TCPTransport.connect` used a blocking `connect(2)`, so
+its `timeout` decided only whether to *retry*. A blocking connect to an address that
+silently drops SYNs parks for the kernel's own TCP timeout — around 75 seconds on macOS —
+and an attempt that cannot be cut short makes the good path unreachable too. The connect
+is now non-blocking with a `poll` on the deadline and `SO_ERROR` for the verdict.
+
+### Rejecting an advertisement that does not match where it came from
+
+The source address of an inbound connection is the one fact about a bootstrap handshake
+that its sender does not choose. `PeerAdvertisement.disavows(source:)` uses it: a rank
+announcing itself as rank *k* has to be dialing from one of the addresses rank *k*
+advertised — every rank advertises every usable address it owns, so its egress address is
+always in its own list. An announcement from anywhere else is either a rank launched with
+a `--bind` that contradicts its own routing, in which case the world half-forms and then
+deadlocks, or a third party claiming a seat. Both are worth refusing.
+
+The check is skipped rather than guessed at when it cannot be made: a transport with no
+addressing of its own reports no source, an empty advertisement contradicts nothing, and
+a loopback source is this machine talking to itself, which no remote party can forge.
+
+### The token, and the version marker
+
+Rank 0's rendezvous listener has the same problem as every other rank, so the token grew
+a multi-host form:
+
+| form | shape | when |
+|---|---|---|
+| `mccl1:<nonce>:<host>:<port>` | one host | emitted verbatim whenever rank 0 has exactly one address |
+| `mccl2:<nonce>:<port>:<host>\|<host>\|…` | several | otherwise |
+
+Both parse. The port moves ahead of the hosts in `mccl2` so an IPv6 literal's colons stay
+unambiguous, and `|` separates hosts because it appears in no IP literal. A single-homed
+cluster's tokens are byte-identical to the ones mccl minted before any of this existed.
+
+A build older than `mccl2` cannot read an `mccl2` token, and that is the honest
+consequence of the format growing: the marker is bumped rather than the new hosts being
+smuggled somewhere an old parser would skip. The same rule governs the address table
+itself — rank 0 sends the old one-address-per-rank shape unless some rank really is
+multi-homed, so a single-homed world never sees a frame an older build could not read.
 
 ## Benchmarks
 
@@ -721,11 +829,10 @@ be right at both ends of that. So: **right shape, wrong constant**, and the hone
 summary is that the planner picks the correct algorithm on either side of a crossover it
 locates in the wrong place.
 
-**What is still unvalidated.** The hierarchical plan, which needs at least two islands of
-two ranks and therefore n ≥ 4 — a uniform three-rank fabric has no islands, and the
-sweep correctly produced no hierarchical rows for it. And this run is Wi-Fi, not
-Thunderbolt: the interesting mixed-speed case, where island detection is supposed to
-earn its place, is a four-machine fabric with both.
+**What was still unvalidated at that point.** The hierarchical plan. A uniform
+three-rank fabric has no islands, and the sweep correctly produced no hierarchical rows
+for it. The mixed-speed case, where island detection is supposed to earn its place, is
+measured below.
 
 ### Two operational notes from that run
 
@@ -750,6 +857,135 @@ working — so rank 0 always came up and every joining rank always failed. It is
 local-network privacy control, which blocks orphaned non-platform binaries' unicast
 dials. Keep the ssh session attached, or launch under launchd.
 
+
+## Measured: mixed fabric, n = 3
+
+The first world mccl has formed that is not uniform: two Mac Studios (M1 Max) on a
+Thunderbolt cable, plus a MacBook Pro (M1 Pro) that can only reach either of them over
+Wi-Fi. One fast island of two, one bridge rank. This is what island detection was written
+for, and until this run nothing had exercised it on hardware.
+
+**A 2+1 fabric does have a hierarchy — the harness was what said otherwise.** The
+planner's island detection asks for at least two groups, fewer groups than ranks, and one
+group with more than one member; `[[0,1],[2]]` satisfies all three, and the hierarchical
+all-reduce already executed it correctly (a singleton island's intra-island reduction is a
+no-op and its leader is itself). What refused it was `mcclbench`'s synthetic plan, which
+required four ranks, so the earlier n = 3 sweep printed *"hierarchical: not applicable"*
+and the shape went unmeasured. What n = 2 genuinely cannot have is a hierarchy: the split
+is two singletons, which is the ring with extra words.
+
+### Which cable each pair actually used
+
+A table of numbers from a world whose paths are unknown says nothing about the fabric it
+claims to measure, so every rank now states its own (`mcclbench` prints it on stderr):
+
+```
+rank 0 paths: 1=169.254.23.203:49247 2=192.168.1.135:61409
+rank 1 paths: 0=169.254.152.222:57404 2=192.168.1.135:61420
+rank 2 paths: 0=192.168.1.250:57404 1=192.168.1.238:49245
+```
+
+0↔1 on the Thunderbolt cable, 0↔2 and 1↔2 on the LAN. Note rank 2 reaching rank 1 at
+`192.168.1.238` — lab-02's `en1` — and not at the `192.168.1.169` on its `en0`, which
+does not accept. Per-pair dialing found that by trying, which is the mechanism working
+rather than a coincidence.
+
+### The measured fabric, and what the planner made of it
+
+`mcclprobe measure`, driven from lab-01 (the only node that can reach both others):
+
+```
+links
+    0 <-> 1   usb4              1.46 GB/s   rtt 213.7 µs
+    0 <-> 2   wifi             70.20 MB/s   rtt 4.52 ms
+
+analysis
+  bottleneck:       70.20 MB/s        fast/slow ratio:  20.76x
+  tree/ring switch: 139.9 KiB         islands:          [0,1] [2]
+```
+
+The islands are detected from the measurements with nothing told to the planner. The
+1↔2 edge is missing because it cannot be probed — that would need lab-02 to dial the
+MacBook, which does not accept LAN dials — and its absence does not change the split: the
+0↔2 Wi-Fi link already establishes the ratio gap. The Thunderbolt link is classified
+`usb4` rather than `thunderbolt4` because 1.46 GB/s is below the 1.8 GB/s the probe uses
+to separate the generations; it is a Thunderbolt cable delivering USB4-class throughput
+over IP, and the label reports the measurement rather than the plug.
+
+Asked for a plan at each size, the planner says `tree` up to 139.9 KiB and `hierarchical`
+above it.
+
+### All-reduce, fp32 sum, algorithm pinned per row
+
+Two independent runs, wall time per call (the slowest rank's, agreed by a one-element max
+all-reduce). Bold is the winner within a run.
+
+| size | ring | tree | hierarchical |
+|---|---|---|---|
+| 16 KiB | 18.806 / 18.086 ms | 17.593 / **14.004** ms | **14.950** / 15.964 ms |
+| 64 KiB | 17.923 / 20.707 ms | **15.398** / 19.573 ms | 19.195 / **15.085** ms |
+| 256 KiB | 31.040 / 27.925 ms | 27.761 / 31.679 ms | **24.759** / **21.530** ms |
+| 1 MiB | 64.119 / 61.917 ms | 84.186 / 50.929 ms | **49.748** / **44.882** ms |
+| 4 MiB | 185.098 / 219.506 ms | 135.824 / 156.460 ms | **117.399** / **118.231** ms |
+| 16 MiB | 803.263 / 763.566 ms | 492.725 / 489.980 ms | **465.358** / **433.581** ms |
+| 64 MiB | — / 3.068 s | — / **1.910 s** | — / 2.073 s |
+
+**Below 256 KiB, nothing is measured here.** The run-to-run spread is as large as the
+between-algorithm spread — tree is 17.6 ms and then 14.0 ms at the same point — so the
+16 KiB and 64 KiB rows say only that Wi-Fi jitter dominates a latency-bound collective.
+The planner picks `tree` there, and this data neither confirms nor contradicts it.
+
+**From 256 KiB to 16 MiB the hierarchical plan wins, in both runs, at every size.** At
+16 MiB it is **1.74× faster than the ring** (449 ms against 783 ms, means of the two
+runs) and 1.09× faster than the tree. That is the first hardware evidence that island
+detection earns its place, and the shape is the one the design predicts: the ring sends
+every chunk across the slow bridge, while the hierarchical plan sums inside the
+Thunderbolt pair first and crosses the Wi-Fi link once.
+
+**At 64 MiB the tree takes it back, by 8%.** One run, one size, so it is a datum rather
+than a trend — but it is on the far side of the planner's choice, and the planner would
+pick hierarchical there. Recorded as it came out.
+
+**The crossover lands in the right place this time.** The closed form puts the switch at
+139.9 KiB; the measurements put it between 64 KiB and 256 KiB. That is a much better
+showing than the all-Wi-Fi n = 3 run, where the same formula was low by 4–13×, and the
+reason is visible in the fabric rather than in the formula: here the bottleneck bandwidth
+is a genuine constant (the Wi-Fi link, whichever size is in flight), whereas a uniform
+Wi-Fi fabric's effective bandwidth moved twentyfold across the sweep and no single `B`
+could describe both ends of it. This is one fabric's agreement, not a general result.
+
+### Against the all-Wi-Fi n = 3 numbers
+
+Same three machines, same sizes, same collective — the only difference is that one of the
+three links is now a cable (§Measured: n = 3):
+
+| size | best all-Wi-Fi | best mixed | gain |
+|---|---|---|---|
+| 1 MiB | 76.165 ms (ring) | 44.882 ms (hierarchical) | 1.70× |
+| 4 MiB | 329.019 ms (ring) | 117.399 ms (hierarchical) | 2.80× |
+| 16 MiB | 1.078 s (ring) | 433.581 ms (hierarchical) | 2.49× |
+
+One third of the links got ~20× faster and the collective got ~2.5× faster, which is the
+right order for a bridge-limited fabric: the slow link is still the bottleneck, and what
+the plan buys is crossing it once instead of `2(n−1)/n` times.
+
+**Adding one fast link also flipped which algorithm is second.** On the uniform Wi-Fi
+fabric the ring beat the tree at 16 MiB (1.078 s against 1.357 s). Here the tree beats the
+ring at 16 MiB by 1.6×. The ring's advantage is that each link carries only `2(n−1)/n` of
+the data — which is worth having when the links are equal and worth nothing when one of
+them is 20× slower than the others and every chunk has to cross it.
+
+### What this run does not settle
+
+- **n = 4, two islands of two.** The lab has three machines. The two-island shape — the
+  one the hierarchical plan was originally written for — is still only tested in the
+  suite, not on hardware. Running two ranks on one studio would produce a fourth rank but
+  not a fourth machine, and an island whose "cable" is a loopback socket would flatter the
+  result rather than test it.
+- **Anything about scale.** Three ranks is three ranks; nothing here says what happens at
+  sixteen.
+- **The 1↔2 link's measured bandwidth**, for the reason given above. The planner reached
+  the right split without it.
 
 ## Measured: reduction kernels
 
@@ -821,7 +1057,12 @@ the absence of the optimiser rather than the kernel.
       reduce-scatter, for every `DataType` and `ReduceOp`, over N ranks rather than 2.
 - [x] **3. Planner with measured thresholds; tree + hierarchical.**
       `TopologyPlanner.plan` / `.analyze` / `.crossoverBytes`, with tree and
-      hierarchical plans actually executable.
+      hierarchical plans actually executable. Validated on hardware at n = 3: ring
+      against tree on a uniform fabric (§Measured: n = 3) and all three algorithms on a
+      genuinely mixed one, where the planner detects the islands from its own
+      measurements and the hierarchical plan it selects is 1.74× the ring at 16 MiB
+      (§Measured: mixed fabric, n = 3). Mixed fabrics need per-pair addressing to form a
+      world at all — see §Per-pair addressing.
 - [x] **4. Wire compression.** `downcast` and `int8Blockwise` round-trip within their
       error bounds; `topK` carries per-stream error-feedback residuals and converges on
       the uncompressed result over repeated calls. The encoders are vectorised
@@ -846,20 +1087,23 @@ the absence of the optimiser rather than the kernel.
   here: mlx-swift ships no distributed support. Python MLX does, so a cross-language
   measurement over the same cable is possible and is recorded in COMPARISON.md, but it
   compares two runtimes rather than two schedulers.
-- **A 3+ node run.** Everything measured so far is n = 2, where the ring degenerates to
-  a single full-duplex exchange and neither the tree's `O(log n)` hops nor the
-  hierarchical plan's single bridge crossing can pay. **Topology selection — the
-  planner, which is the library's main claim — is therefore unvalidated on hardware.**
-  This is the most valuable measurement still outstanding.
+- ~~**A 3+ node run.**~~ Done — §Measured: n = 3 (uniform Wi-Fi, ring against tree) and
+  §Measured: mixed fabric, n = 3 (a Thunderbolt island plus a Wi-Fi bridge rank, all
+  three algorithms, with the paths each pair chose recorded next to the numbers).
+- **n = 4 with two islands of two, on hardware.** The lab has three machines, so the
+  two-island shape the hierarchical plan was originally written for is still only tested
+  in the suite. And nothing measured anywhere here says what happens at sixteen nodes.
 - **Thunderbolt-specific transport.** The `Transport` protocol is the seam: a bulk-DMA
   TB transport implements `listen`/`connect` and everything above it is unchanged.
   Today TB is reached as ordinary IP over the Thunderbolt bridge.
 - **A real rendezvous service.** `Rendezvous` is one round trip through rank 0 —
   enough for `mcclCommInitRank`, not enough for a long-lived cluster. No discovery, no
   membership change, no recovery from a rank restarting, no reconnection.
-- **Non-blocking C calls.** The shim runs every collective to completion. A genuine
-  `mcclStream_t` execution context, with `mcclGroupStart`/`mcclGroupEnd` batching,
-  waits on there being a device queue worth enqueueing onto.
+- **Non-blocking calls beyond all-reduce.** `mcclAllReduceAsync` /
+  `mcclRequestWait` / `mcclRequestTest` ship (§C API); all-gather, broadcast, reduce and
+  reduce-scatter are still blocking-only. `mcclGroupStart`/`mcclGroupEnd` batching is not
+  built either — and, unlike the async issue, it waits on there being a device queue
+  worth batching onto.
 - ~~**Vectorised reduction kernels.**~~ Done — see §Measured: reduction kernels. The
   same per-element-switch pattern was in `Kernels.reduce`, and the same fix applied:
   4.4–5.1× on fp32, up to 21× on int8. `Kernels.scale` needed nothing and got nothing.

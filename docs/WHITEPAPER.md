@@ -26,16 +26,22 @@ uncompressed all-reduce rate is below the codec's own encode/decode ceiling*.
 That rule made a falsifiable prediction, which we then tested by vectorising the
 encoders: two of the three codecs cleared the cable's rate and flipped from
 losing 20–45% to winning 1.1–1.7×, while the third, whose ceiling stayed below
-the cable, stayed a loss. A three-node run gives the planner its first hardware
-test: tree wins below the crossover and ring above it, as the model requires,
-though the closed-form threshold is 4–13× low on a fabric whose bandwidth is not
-constant in message size. We also report an MLX adapter and a data-parallel
+the cable, stayed a loss. Two three-node runs test the planner. On a uniform
+Wi-Fi fabric, tree wins below the crossover and ring above it, as the model
+requires, though the closed-form threshold is 4–13× low on a fabric whose
+bandwidth is not constant in message size. On a genuinely mixed one — two
+machines on a Thunderbolt cable plus a laptop reachable only over Wi-Fi, a world
+that forms at all only because each pair of ranks selects its own address — the
+planner detects the islands from its own measurements and the hierarchical plan
+it selects beats the ring by 1.74× at 16 MiB, the first hardware evidence for
+the part of the design that island detection exists to serve. We also report an
+MLX adapter and a data-parallel
 training demo whose two-rank loss trajectory reproduces a single-process run on
 the combined batch to 4.8e-07 in one process and 3.6e-05 across two machines —
 and which is, at small batch, honestly slower than one machine, with the
-crossover measured rather than assumed. Correctness is evaluated by 273 tests at
-90.56% region coverage, including byte-level interoperation between the
-vectorised and scalar encoders.
+crossover measured rather than assumed. Correctness is evaluated by 309 tests at
+89.98% region coverage, run in CI on every push, including byte-level
+interoperation between the vectorised and scalar encoders.
 
 ---
 
@@ -149,12 +155,27 @@ to offer — the opposite of the shape of NCCL's curve.
 
 **The planner measures the fabric instead of assuming it.** There is no NVLink
 enumeration to read on a Mac, so mccl probes pairwise bandwidth and minimum
-latency and solves ring order, tree root and the ring/tree crossover from them
-(§4.1). At n = 3 that selection has hardware evidence — tree wins by 1.87×, 1.58×,
-1.17× while the collective is latency-bound and ring wins by 1.32×, 1.03×, 1.26×
-once it is bandwidth-bound (§6.1d) — with the honest caveat
-that the closed-form threshold locates the crossover 4–13× low on a fabric whose
-bandwidth is not constant in message size.
+latency and solves ring order, tree root, island membership and the crossover
+from them (§4.1, §4.2). At n = 3 that selection has hardware evidence on two
+different fabrics. On a uniform Wi-Fi one, tree wins by 1.87×, 1.58×, 1.17× while
+the collective is latency-bound and ring wins by 1.32×, 1.03×, 1.26× once it is
+bandwidth-bound (§6.1d) — with the caveat that the closed-form threshold locates
+the crossover 4–13× low there, on a fabric whose bandwidth is not constant in
+message size. On a *mixed* one — two machines on a Thunderbolt cable plus a
+laptop reachable only over Wi-Fi — the planner detects the islands from its own
+measurements, and the hierarchical plan it selects is 1.74× the ring at 16 MiB
+and wins at every size from 256 KiB to 16 MiB across two runs (§6.1f). On that
+fabric the same closed form lands in the right place, because the bottleneck
+really is one constant.
+
+**The mixed case is also where a single address per rank stops working.** A world
+spanning a Thunderbolt island and a Wi-Fi bridge has no address per rank that all
+of its peers can dial, so each rank advertises every address it owns and each
+*pair* selects its own path — ranked by the media of the dialer's own egress
+interface, then resolved by dialing, because three Thunderbolt ports on one
+machine share one `169.254/16` and no subnet match can separate them (§4.5).
+NCCL's equivalent problem is solved by the fabric being homogeneous and
+enumerable; mccl's fabric is whatever cables are in the room.
 
 **The economic frame follows from the hardware, not from a benchmark.** NVIDIA's
 cluster story prices in the fabric: NVLink domains and InfiniBand are capital
@@ -177,12 +198,18 @@ at 16,384 (§6.1e).
 gives up roughly 58% of line rate to the stack before mccl runs, so against the
 raw line mccl's 25–30% sits below NCCL-over-TCP's published 32–48%, and an
 RDMA-class fabric is out of reach entirely until the bulk-DMA transport of §7
-exists. *Scale:* the planner is validated at n = 3 and the hierarchical plan that
-motivates island detection is untested, since it needs two islands of two ranks;
-nothing here says what happens at 16 nodes. *Maturity:* NCCL is production
-infrastructure every framework already targets, with asynchronous stream semantics
-mccl's blocking v0 does not offer, and the head-to-head against MLX's own ring
-that would settle the Mac-side comparison is blocked upstream (§7).
+exists. *Scale:* the planner is validated at n = 3 on both a uniform and a mixed
+fabric, and the hierarchical plan now has hardware evidence — but only in its
+smallest form, one island of two plus one bridge rank. Two islands of two is
+tested in the suite and not on hardware, because the lab has three machines; and
+nothing anywhere here says what happens at 16 nodes. *Maturity:* NCCL is
+production infrastructure every framework already targets. mccl's asynchrony is
+narrower than NCCL's in two ways that should be said plainly: it covers
+all-reduce only, and because a communicator's collectives run on one serial
+queue, what overlaps is the caller's work with the collective — not two
+collectives with each other, as it would be on independent CUDA streams (§5).
+The head-to-head against MLX's own ring that would settle the Mac-side
+comparison is blocked upstream (§7).
 
 ---
 
@@ -335,12 +362,48 @@ communicator need two streams or they would share a history. Crucially,
 model state: a checkpoint saved without it has silently discarded part of a
 gradient.
 
+### 4.5 Per-pair addressing
+
+A collectives library for a homogeneous fabric can carry one address per rank.
+NCCL does, and can, because the fabric it addresses is enumerable and uniform.
+The fabric mccl addresses is whatever cables are in the room, and on the fabric
+island detection exists for, one address per rank cannot work at all: a world
+spanning a Thunderbolt island and a Wi-Fi bridge has no address per rank that all
+of its peers can dial. The studio next to you is on `169.254/16`; the laptop
+across the room is on `192.168.1/24`; a rank advertising either is unreachable
+from the other side.
+
+So each rank advertises every usable address it owns and each **pair** selects
+its own path. The ordering rule is that a path is ranked by the media of the
+*dialer's own egress interface* — the local interface whose subnet contains the
+advertised address — and not by the media the advertiser claims. The distinction
+is not fussiness: what determines the cost of a hop is the cable the bytes leave
+on, which the dialer can observe, and not the hardware the peer says it owns,
+which it cannot verify.
+
+Ordering alone is insufficient, and the reason is instructive. Three Thunderbolt
+ports on one machine all carry `169.254/16` addresses, so a subnet match cannot
+say which of them holds the cable that reaches *this* peer. mccl therefore
+resolves the order by dialing it: walk the candidates with a short per-attempt
+timeout, take the first connection that completes. Reachability is measured, not
+inferred, which is the stance the library already takes towards bandwidth.
+
+Two consequences worth recording. First, an inbound handshake can be checked
+against the one fact its sender does not choose — the source address it arrived
+from — since a rank that advertises all its addresses always egresses from one of
+them; an announcement from anywhere else is refused rather than allowed to
+half-form a world that then deadlocks. Second, the rendezvous token had to grow a
+multi-host form, and its version marker was bumped rather than the extra hosts
+being smuggled somewhere an old parser would skip: a single-homed cluster's
+tokens remain byte-identical, and a multi-homed one's are honestly labelled as
+something an older build cannot read.
+
 ---
 
 ## 5. Implementation
 
-mccl is 3,982 lines of Swift in the core library, 796 in the C shim and its
-hand-written header, and 926 in the benchmark harness and two CLIs, with **no
+mccl is 5,358 lines of Swift in the core library, 955 in the C shim and its
+hand-written header, and 1,857 in the benchmark harness and two CLIs, with **no
 external package dependencies**. The transports are POSIX sockets directly.
 
 **Transport stack.** The layering is `Collectives → Planner → Wire → Transport`,
@@ -382,6 +445,27 @@ NCCL's spelling; the ABI stays portable. `mcclResult_t` maps one-to-one onto
 `MCCLError` — the enum was written flat for exactly this — and `mcclDataType_t`
 is `DataType.wireCode`, the discriminator already in every frame header, so a C
 caller and a Swift caller cannot disagree about what is in a frame.
+
+*Asynchrony without a device queue.* NCCL's non-blocking issue is the CUDA
+stream's: `ncclAllReduce` enqueues onto a stream the caller already owns, and the
+caller synchronises the stream. The mechanism is borrowed, not built. mccl has no
+device queue to borrow, and its `mcclStream_t` already denotes something else —
+the sequence a top-k residual belongs to (§4.4). Overloading that handle would
+have given one type two jobs *and* silently turned every existing blocking call
+non-blocking, so callers reading a buffer on return would begin reading it
+mid-flight. mccl therefore takes MPI's shape: `mcclAllReduceAsync` returns an
+`mcclRequest_t`, `mcclRequestWait` blocks and frees it, `mcclRequestTest` asks
+without blocking, and `mcclAllReduce` is unchanged.
+
+The limits are worth stating rather than implying past. A communicator's
+collectives run on one serial queue and the enqueue is synchronous at issue, so
+several outstanding requests execute in issue order. That ordering is required,
+not incidental: ranks must run collectives in the same sequence or they deadlock
+against one another, and with non-blocking issue the order of the calls is the
+only sequence every rank can agree on. What is genuinely overlapped is therefore
+the caller's own computation with the collective's socket traffic — which on a
+Mac cluster is where the time goes — and not two collectives with each other, as
+independent CUDA streams would give. Coverage is all-reduce only.
 
 ---
 
@@ -739,34 +823,116 @@ is why the safe choice is also the cheap one. Unified memory means the pointer h
 mccl is the one the GPU reads, so no host/device staging occurs anywhere — the property a
 CUDA equivalent could not have.
 
+### 6.1f A genuinely mixed fabric, and the first test of island detection
+
+Every measurement above is on one fabric at a time. Island detection — the part of the
+planner that motivates the hierarchical plan (§4.2) — needs a fabric that is measurably
+two fabrics, and had never seen one.
+
+**The world:** two Mac Studios (M1 Max) on a direct Thunderbolt cable, plus a MacBook Pro
+(M1 Pro) reachable from either of them only over Wi-Fi. One fast island of two ranks, one
+bridge rank. Forming it at all required per-pair addressing (§4.5); a single address per
+rank cannot describe this world, which is why the two features arrived together.
+
+**A 2+1 fabric does have a hierarchy.** The obvious reading of "hierarchical needs two
+islands of two ranks" says otherwise, and is wrong. Island detection asks for at least two
+groups, fewer groups than ranks, and one group with more than one member, and
+`[[0,1],[2]]` satisfies all three; the hierarchical all-reduce already executed it (a
+singleton island's intra-island reduction is a no-op and its leader is itself). What had
+refused the shape was the benchmark harness, which required four ranks, so the earlier
+n = 3 sweep reported the algorithm as inapplicable and it went unmeasured. n = 2 is the
+case that genuinely has no hierarchy: the split is two singletons, which is the ring.
+
+**The planner's own reading of the fabric,** from `mcclprobe measure`, with nothing told
+to it:
+
+| path | measured bandwidth | measured RTT |
+|---|---|---|
+| 0 ↔ 1, Thunderbolt cable | 1.46 GB/s | 213.7 µs |
+| 0 ↔ 2, Wi-Fi | 70.20 MB/s | 4.52 ms |
+
+Ratio 20.76×, islands `[0,1] [2]`, crossover 139.9 KiB — `tree` below it, `hierarchical`
+above.
+
+**All-reduce, fp32 sum, algorithm pinned per row, two independent runs.** Wall time per
+call, slowest rank:
+
+| size | ring | tree | hierarchical |
+|---|---|---|---|
+| 16 KiB | 18.8 / 18.1 ms | 17.6 / **14.0** ms | **15.0** / 16.0 ms |
+| 64 KiB | 17.9 / 20.7 ms | **15.4** / 19.6 ms | 19.2 / **15.1** ms |
+| 256 KiB | 31.0 / 27.9 ms | 27.8 / 31.7 ms | **24.8** / **21.5** ms |
+| 1 MiB | 64.1 / 61.9 ms | 84.2 / 50.9 ms | **49.7** / **44.9** ms |
+| 4 MiB | 185.1 / 219.5 ms | 135.8 / 156.5 ms | **117.4** / **118.2** ms |
+| 16 MiB | 803.3 / 763.6 ms | 492.7 / 490.0 ms | **465.4** / **433.6** ms |
+| 64 MiB | — / 3.068 s | — / **1.910 s** | — / 2.073 s |
+
+**Below 256 KiB this measures nothing.** Run-to-run spread equals between-algorithm
+spread — tree is 17.6 ms and then 14.0 ms at the same point — so those rows report Wi-Fi
+jitter on a latency-bound collective and neither confirm nor contradict the planner's
+choice of `tree` there.
+
+**From 256 KiB to 16 MiB the hierarchical plan wins in both runs at every size.** At
+16 MiB it is **1.74× the ring** (449 ms against 783 ms, means of the two runs) and 1.09×
+the tree. This is the first hardware evidence that island detection earns its place, and
+the shape is the predicted one: the ring pushes every chunk across the slow bridge, the
+hierarchical plan sums inside the Thunderbolt pair and crosses the Wi-Fi link once.
+
+**At 64 MiB the tree takes it back by 8%** — one run, one size, on the far side of the
+planner's choice. Recorded as it came out.
+
+**Against the uniform Wi-Fi n = 3 numbers** (§6.1d), same three machines, same sizes, one
+link upgraded to a cable: 1.70× at 1 MiB, 2.80× at 4 MiB, 2.49× at 16 MiB, best against
+best. A third of the links got ~20× faster and the collective got ~2.5× faster, which is
+the right order for a bridge-limited fabric — the slow link is still the bottleneck, and
+what the plan buys is crossing it once.
+
+**Two secondary findings.** The closed-form crossover, low by 4–13× on the uniform Wi-Fi
+fabric, lands correctly here (139.9 KiB predicted, 64–256 KiB measured); the difference is
+in the fabric, not the formula, since a mixed fabric's bottleneck bandwidth really is one
+constant while a Wi-Fi fabric's moved twentyfold across the sweep. And adding one fast
+link inverted the second-place ordering: ring beat tree at 16 MiB on uniform Wi-Fi, tree
+beats ring by 1.6× here. The ring's `2(n−1)/n` per-link advantage is worth having when the
+links are equal and worth nothing when one of them is 20× slower and every chunk must
+cross it.
+
+**What this does not settle:** n = 4 with two islands of two, which the lab's three
+machines cannot produce and which running two ranks on one studio would flatter rather
+than test; and anything at all about sixteen nodes.
+
 
 ### 6.2 Correctness
 
-The test suite is 273 tests across 21 suites, all passing, run with
-`swift test`. They are split across two test targets: 239 tests exercise the core
+The test suite is 309 tests across 23 suites, all passing, run with
+`swift test`. They are split across two test targets: 275 tests exercise the core
 library, which has no dependencies, and 34 exercise the MLX adapter. The split is
 deliberate — `MCCL`'s tests must keep running on a machine that has never fetched
-mlx-swift and has no Metal shader library installed.
+mlx-swift and has no Metal shader library installed. A GitHub Actions workflow
+runs both on macOS arm64 on every push; the MLX suites skip themselves there, for
+the one reason, and the workflow checks that it *was* that reason rather than
+treating any skip as a pass.
 
 | suite | tests | what it covers |
 |---|---|---|
 | CollectiveTests | 25 | all five collectives × dtypes × ops × plans |
+| PlannerTests | 24 | crossover, island detection incl. a singleton bridge rank, ring order, trees |
 | BenchmarkTests | 22 | the benchmark harness, its argument parsing, and inapplicable-algorithm reporting |
-| PlannerTests | 20 | crossover, island detection, ring order, trees |
+| PeerAdvertisementTests | 21 | what a rank advertises, the path-selection rule, disavowed announcements, multi-address worlds over real sockets |
 | DistributedBenchmarkTests | 20 | distributed bring-up, cross-rank agreement, and real spawned `mcclbench` worlds |
 | TopKTests | 17 | selection, block layout, residuals, convergence |
+| RendezvousTests | 17 | token encoding in both versions, address exchange, `join` |
 | TCPTransportTests | 15 | socket error paths: bind, resolve, hang-up |
 | CShimTests | 13 | the C ABI, incl. a compiled four-rank C client |
-| CodecBenchmarkTests | 10 | the codec-throughput mode and the ceilings it derives |
 | CompressionTests | 12 | codec round-trips within their error bounds |
 | CompressionInteropTests | 12 | vectorised frames against the scalar reference, both directions |
 | FabricTests | 12 | mesh bring-up failures, plan sanitising |
 | RendezvousProtocolTests | 11 | forged and malformed rendezvous frames |
-| RendezvousTests | 11 | token encoding, address exchange, `join` |
+| CodecBenchmarkTests | 10 | the codec-throughput mode and the ceilings it derives |
 | DiagnosticsTests | 9 | error text, plan text, analysis accessors |
 | NetworkInterfaceTests | 9 | interface enumeration and media classification |
 | ProbeTests | 8 | probe protocol and topology construction |
 | TransportTests | 8 | framing, loopback and TCP round trips |
+| CollectiveRequestTests | 5 | non-blocking issue, issue-order completion, failure surfacing from `wait` |
 | ReduceKernelTests | 5 | every (dtype, op) reduction against an independent reference, incl. NaN asymmetry |
 | MLXCollectiveTests | 17 | the adapter's collectives over a 2-rank loopback world, every dtype, every codec |
 | MLXBridgeTests | 10 | dtype mapping, copy accounting, in-place mutation, Foundation's inline-`Data` boundary |
@@ -790,15 +956,17 @@ Coverage, regenerated with `swift test --enable-code-coverage` and `llvm-cov`:
 
 | metric | covered |
 |---|---|
-| region | **90.56%** (224 of 2373 regions missed) |
-| function | **94.43%** (35 of 628 missed) |
-| line | **97.05%** (141 of 4783 missed) |
+| region | **89.98%** (286 of 2854 regions missed) |
+| function | **92.59%** (61 of 823 missed) |
+| line | **96.10%** (227 of 5817 missed) |
 
-The lowest files are `Collectives.swift` (87.07% region) and `DataType.swift`
-(86.15%), where the residue is dtype × op × plan combinations covered
-behaviourally through other paths. What remains uncovered is dominated by
-defensive code unreachable without injecting faults into libc — `EINTR` retry
-loops, `socket()` returning a negative descriptor — which we did not chase.
+The lowest files are `DistributedBenchmark.swift` (79.12% region),
+`TCPTransport.swift` (81.25%) and `Rendezvous.swift` (84.44%). What remains
+uncovered is dominated by two things we did not chase: defensive code unreachable
+without injecting faults into libc — `EINTR` retry loops, `socket()` returning a
+negative descriptor, `getsockopt` failing on a live descriptor — and the
+cross-machine paths, whose error branches need two machines and a cable pulled
+mid-run rather than a test host.
 
 ### 6.3 Loopback benchmarks, and what they measure
 
@@ -933,8 +1101,9 @@ error-feedback argument does not hold.
 The implementation is complete enough to evaluate: all five collectives across
 five dtypes and five reductions, three executable plans, three wire codecs, a
 probe, a planner, a C ABI validated by a compiled C client, and a benchmark
-harness, an MLX adapter and a data-parallel training demo — 273 tests at 90.56%
-region coverage, and no external dependencies outside the MLX target. The
+harness, an MLX adapter and a data-parallel training demo — 309 tests at 89.98%
+region coverage, run in CI on every push, and no external dependencies outside
+the MLX target. The
 first real-hardware measurement puts a direct Thunderbolt link at 1.06 GB/s and
 167.8 µs, 42.4% of its negotiated line rate, with both paths between the machines
 correctly classified. On that link the compression rule of §6.1a has now been
@@ -942,21 +1111,33 @@ tested rather than merely stated: vectorising the encoders lifted two codecs'
 ceilings above the fabric's rate and both flipped from losing to winning, while
 the third stayed below it and stayed a loss.
 
-Two of the three pieces that were missing are now in place. The planner's
-qualitative claim has been tested at three ranks and holds — tree below the
-crossover, ring above — though the closed-form threshold is 4–13× low on a fabric
-whose bandwidth is not constant in message size, so "solved, not tuned" survives
-for which algorithm and not for where to switch. And an MLX adapter now exists,
-with a data-parallel training demo whose two-rank loss trajectory reproduces a
-single-process run to floating-point noise on real hardware — and which is, at
-small batch, honestly slower than one machine, with the batch at which a second
-machine starts paying measured rather than assumed.
+All three of the pieces that were missing are now in place. The planner's
+qualitative claim has been tested at three ranks on a uniform fabric and holds —
+tree below the crossover, ring above — though the closed-form threshold is 4–13×
+low there, on a fabric whose bandwidth is not constant in message size, so
+"solved, not tuned" survives for which algorithm and, on that fabric, not for
+where to switch. An MLX adapter now exists, with a data-parallel training demo
+whose two-rank loss trajectory reproduces a single-process run to floating-point
+noise on real hardware — and which is, at small batch, honestly slower than one
+machine, with the batch at which a second machine starts paying measured rather
+than assumed.
 
-What is still not established is the claim the design rests on: that a
-measured-topology planner with wire compression beats a fixed ring on a real
-*mixed-speed* cluster. That needs four or more machines with two fast islands, and
-it is the only remaining experiment that would test §4.2 at all. The head-to-head
-against MLX's own ring, meanwhile, is blocked upstream rather than here:
+And the claim the design rests on — that a measured-topology planner beats a
+fixed ring on a real *mixed-speed* cluster — now has evidence. Two Mac Studios on
+a Thunderbolt cable plus a laptop reachable only over Wi-Fi is a 20.76× ratio
+across one world; mccl detects the islands from its own probe and the
+hierarchical plan it selects runs 1.74× the ring at 16 MiB and wins at every size
+from 256 KiB up, across two runs (§6.1f). Forming that world at all required the
+per-pair addressing of §4.5, which is the part of this that was not anticipated:
+a mixed fabric is not merely a harder scheduling problem, it is one where a
+single address per rank does not describe the cluster.
+
+Three things remain unestablished, and the mixed-fabric result should not be read
+as covering them. It is the *smallest* mixed fabric — one island of two plus one
+bridge rank — so two islands of two is still only tested in the suite; the lab has
+three machines, and a fourth rank sharing a machine would flatter the result
+rather than test it. Nothing measured anywhere here speaks to sixteen nodes. And
+the head-to-head against MLX's own ring is blocked upstream rather than here:
 mlx-swift does not build MLX's distributed backends and exposes no distributed
 API, so there is currently nothing to compare against in the same language.
 
@@ -964,7 +1145,8 @@ API, so there is currently nothing to compare against in the same language.
 
 *Measurements on the development machine were taken on an Apple M1 Pro (16 GB
 unified memory, macOS 26.5.1, Swift 6.2.3). The two-machine Thunderbolt figures
-were measured on a pair of Mac Studio M1 Max machines. Coverage figures are
+were measured on a pair of Mac Studio M1 Max machines; the three-node mixed-fabric
+figures on those two plus the development machine, joined over Wi-Fi. Coverage figures are
 reproducible with `swift test --enable-code-coverage` followed by `xcrun llvm-cov
 report`; see [USAGE.md](USAGE.md) for the tool invocations and
 [ARCHITECTURE.md](ARCHITECTURE.md) for the component-level design.*

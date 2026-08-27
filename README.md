@@ -52,9 +52,10 @@ Milestones 1–4 are implemented and tested; milestone 5 is nearly complete — 
 shim, the benchmark harness and the MLX adapter are all in, and the one piece
 still missing is blocked upstream rather than here.
 
-**273 tests, all passing** (239 for the core library, 34 for the MLX adapter, which
+**309 tests, all passing** (275 for the core library, 34 for the MLX adapter, which
 lives in its own test target so that `MCCL`'s tests never acquire an MLX
-dependency). First real-hardware validation: two Mac Studio M1 Max machines on a
+dependency), run in CI on macOS arm64 on every push. First real-hardware
+validation: two Mac Studio M1 Max machines on a
 direct Thunderbolt cable negotiated at 20 Gb/s probed at **1.06 GB/s and 167.8 µs**,
 with the Thunderbolt and Wi-Fi paths correctly classified from interface media.
 
@@ -87,12 +88,27 @@ probed α and B, predicts ~75 KB — low by 4–13×, consistent with the model 
 single bandwidth while Wi-Fi's effective bandwidth moves twentyfold across the sweep.
 Right shape, wrong constant.
 
-Two things are still untested: the **hierarchical** plan, which needs at least two
-islands of two ranks (n ≥ 4), and the mixed-speed fabric that island detection exists
-for. Note also that the earlier n = 2 result — ring beating tree by 1.72× — supports a
-narrower claim than it looks: at two ranks the ring degenerates to a single full-duplex
-point-to-point exchange, its best case, so that measurement says *the executor exploits
-full duplex*, not that topology selection works.
+**And island detection now has hardware evidence too, on a genuinely mixed fabric.**
+The same three machines, but with the two Studios on their Thunderbolt cable and the
+laptop reachable from either only over Wi-Fi — a 20.76× ratio inside one world. The
+probe finds the islands unaided (`[0,1] [2]`), and the hierarchical plan wins at every
+size from 256 KiB to 16 MiB across two runs, reaching **1.74× the ring at 16 MiB**
+(449 ms against 783 ms) and 2.49× the best all-Wi-Fi time at the same size. On this
+fabric the closed-form crossover also lands correctly — 139.9 KiB predicted, 64–256 KiB
+measured — because a mixed fabric's bottleneck really is one constant. At 64 MiB the
+tree takes it back by 8%, on one run; recorded as it came out.
+
+Forming that world at all needed **per-pair addressing**: a fabric spanning a
+Thunderbolt island and a Wi-Fi bridge has no single address per rank that all of its
+peers can dial, so every rank advertises all of its addresses and every *pair* selects
+and then *dials* its own best path. See
+[ARCHITECTURE.md § Per-pair addressing](docs/ARCHITECTURE.md#per-pair-addressing).
+
+Still untested on hardware: two islands of two ranks (the lab has three machines), and
+anything at all about scale beyond n = 3. Note also that the earlier n = 2 result — ring
+beating tree by 1.72× — supports a narrower claim than it looks: at two ranks the ring
+degenerates to a single full-duplex point-to-point exchange, its best case, so that
+measurement says *the executor exploits full duplex*, not that topology selection works.
 
 Collective throughput is measured on that cable rather than only over loopback.
 `mcclbench` runs distributed (`--rank` / `--world-size`, joining through a rendezvous
@@ -217,7 +233,7 @@ mlx-swift compiles MLX's C++ core under SwiftPM but does not build `mlx.metallib
 aborts on its first GPU operation. The script fetches the version-matched shader
 library from the `mlx-metal` pip wheel and installs it beside the built binaries.
 Tests that need it skip with this instruction if it is absent; the core library's
-239 tests never load MLX at all.
+275 tests never load MLX at all.
 
 ## Using the probe
 

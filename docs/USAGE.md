@@ -528,6 +528,68 @@ must run in rank 0's own process, and there is no discovery, no membership
 change, and no recovery from a rank restarting. See
 [Implementing what is missing](#implementing-what-is-missing).
 
+#### Machines with more than one cable
+
+A machine on a Thunderbolt bridge *and* a LAN has more than one address, and its
+peers do not all reach it on the same one. Since a world spanning both has no
+single address per rank that everybody can dial, every rank advertises all of its
+addresses and every *pair* selects its own path.
+
+By default this needs no configuration at all — `createUniqueID` and `join`
+discover every usable local address and advertise all of them:
+
+```swift
+// Rank 0: the token names every address its rendezvous listener answers on.
+// On a machine with a TB bridge and a LAN, that is an mccl2 token with two
+// hosts; on a single-homed machine it is the mccl1 token it always was.
+let id = try Rendezvous.createUniqueID()          // binds 0.0.0.0
+
+// Every rank: binds the wildcard, advertises everything it owns.
+let comm = try Communicator.join(uniqueID: id, rank: rank, worldSize: worldSize)
+```
+
+Pass `advertisedHosts` when you want to *pin* the run to specific cables — which
+is what a benchmark measuring a named link needs, since it is the only way to be
+sure the traffic crossed it:
+
+```swift
+let id = try Rendezvous.createUniqueID(
+    host: "0.0.0.0", advertisedHosts: ["169.254.152.222", "192.168.1.250"])
+
+let comm = try Communicator.join(
+    uniqueID: id, rank: rank, worldSize: worldSize,
+    advertisedHosts: ["169.254.23.203", "192.168.1.238"])
+```
+
+`MCCL_HOST` does the same thing from the environment and now takes a
+comma-separated list; one value still means exactly what it always did.
+
+**How a pair chooses.** Candidates are ordered by the media of the *dialer's own*
+egress interface — the local interface whose subnet contains the advertised
+address — `thunderbolt > ethernet > wifi > other > unroutable`, with the
+advertiser's own tag and then its stated order as tiebreaks. The order is then
+*resolved by dialing it*: mccl tries each candidate with a short timeout and takes
+the first that connects. That last step is not belt-and-braces. Three Thunderbolt
+ports on one machine all carry `169.254/16` addresses, and no subnet match can say
+which of them holds the cable to this particular peer — only opening the socket
+can.
+
+**Verifying what was chosen.** `Communicator.fabricPaths` names the address this
+rank reaches each peer on, and `mcclbench` prints it on stderr:
+
+```
+rank 0 paths: 1=169.254.23.203:49247 2=192.168.1.135:61409
+```
+
+Rank 0 is on the Thunderbolt cable to rank 1 and on the LAN to rank 2. Check this
+before believing a table that claims to describe a particular fabric.
+
+**One announcement is refused.** A rank dialing in from an address it never
+advertised cannot be dialed back there, so the world would half-form and then
+deadlock on the first collective. mccl rejects the handshake instead, with the
+observed address and the advertised list in the message. If you see this, a rank
+was launched with an `--bind` that contradicts its own routing.
+
 ### 3. Run the collectives
 
 All five, for every `DataType` (`.float32`, `.float16`, `.bfloat16`, `.int32`,
@@ -979,18 +1041,76 @@ run time without `DYLD_LIBRARY_PATH`.
 
 ### Where mccl differs from NCCL, and why
 
-- **Every call blocks.** NCCL enqueues onto a CUDA stream and returns; mccl v0
-  has no device queue to enqueue onto, so a collective runs to completion and
-  returns when the buffers are safe to touch again.
+- **The plain calls block; asynchrony is a separate entry point.** NCCL enqueues
+  onto a CUDA stream and returns, and you synchronise the stream. mccl has no
+  device queue to borrow, so `mcclAllReduce` runs to completion and returns when
+  the buffers are safe to touch, and non-blocking issue is `mcclAllReduceAsync` +
+  `mcclRequestWait` / `mcclRequestTest`. See below.
 - **`mcclStream_t` is not an execution context.** It names an independent
   *sequence* of collectives, which matters only to top-k's per-stream residual.
   Build one with `mcclStreamFromId(7)`; `NULL` is the default stream. Rank `r`
-  and rank `s` must use the same id for the same tensor.
+  and rank `s` must use the same id for the same tensor. It is deliberately *not*
+  the thing you wait on — that would give one handle two jobs.
 - **`mcclCommInitRank` is a `static inline`.** A by-value 128-byte
   `mcclUniqueId` has a different ABI on arm64 and x86_64, so the exported symbol
   (`mcclCommInitRankFromId`) takes the token by pointer and the header restores
   the idiomatic call site. Source-compatible with NCCL either way.
 - **One communicator, one thread.** Different communicators are independent.
+
+### Non-blocking all-reduce
+
+Issue returns a handle; the handle is waited or tested. This is MPI's shape, not
+CUDA's, for the reasons in the bullet above.
+
+```c
+enum { INFLIGHT = 4 };
+float* buffers[INFLIGHT];
+mcclRequest_t requests[INFLIGHT];
+
+for (int k = 0; k < INFLIGHT; ++k) {
+    buffers[k] = make_gradient_chunk(k);
+    mcclResult_t r = mcclAllReduceAsync(buffers[k], buffers[k], COUNT,
+                                        mcclFloat32, mcclSum, comm, NULL,
+                                        &requests[k]);
+    if (r != mcclSuccess) { /* ... */ }
+}
+
+/* Your own work goes here — this is the whole point. */
+do_something_useful();
+
+int done = 0;
+mcclRequestTest(requests[0], &done);        /* never blocks, never frees */
+
+for (int k = 0; k < INFLIGHT; ++k) {
+    mcclResult_t r = mcclRequestWait(requests[k]);   /* blocks, then frees */
+    if (r != mcclSuccess) fprintf(stderr, "%s\n", mcclGetLastError(comm));
+}
+```
+
+Four rules, and none of them are optional:
+
+1. **The buffers belong to the collective until `mcclRequestWait` returns.** Do
+   not read, write or free them before then. (`sendbuff` is the exception: when
+   it differs from `recvbuff` its contents are copied synchronously at issue, so
+   it is yours again the moment the issue call returns.)
+2. **Every request must be waited.** There is no free-without-wait, deliberately:
+   abandoning a request would leave a collective writing into memory the caller
+   believes it has back. The handle is invalid once `mcclRequestWait` returns,
+   whether it succeeded or failed.
+3. **Requests complete in issue order.** Collectives on one communicator run on
+   its serial queue. This is required, not a limitation to route around: every
+   rank must run collectives in the same sequence or they deadlock against each
+   other, and issue order is the only sequence they all agree on. So every rank
+   must issue the same operations in the same order, exactly as with the blocking
+   calls.
+4. **Failures surface from `wait`, not from issue.** Nothing has run when the
+   issue call returns, so there is nothing to report yet. `mcclRequestTest`
+   reports whether the question could be *answered*, not what the collective did.
+
+What this buys is overlap between your work and the collective's socket traffic —
+on a Mac cluster, where the time goes. It does not make two collectives run at
+once, as independent CUDA streams would. Coverage is all-reduce only;
+all-gather, broadcast, reduce and reduce-scatter are blocking.
 
 ### Error handling
 
@@ -1117,7 +1237,7 @@ grid, and prints the same table — over whatever cable the machines share.
 | `--token <text>` | — | join the world named by this token |
 | `--token-file <path>` | — | rank 0 writes the token here; other ranks poll for it |
 | `--emit-token` | — | rank 0 prints `MCCL_TOKEN=<text>` on stdout, first line |
-| `--bind <host>` | — | local address to bind *and* advertise |
+| `--bind <hosts>` | auto | address(es) to advertise, comma-separated; the flag may also be repeated |
 | `--rendezvous-port <n>` | any | fixed port for rank 0's rendezvous listener |
 | `--timeout <seconds>` | 120 | bring-up deadline |
 | `--label <name>` | — | name for the fabric, echoed into the header |
@@ -1137,14 +1257,44 @@ studio-b$ mcclbench --rank 1 --world-size 2 --bind 169.254.23.203 \
 
 Four things are worth knowing before you trust the numbers that come out:
 
-**Pass `--bind` on any machine with more than one interface.** Without it the
-listener binds a wildcard and advertises whatever
-`NetworkInterfaces.preferredLocalAddress()` prefers, which may not be the cable
-you meant to measure. `--bind` pins both. Never use an mDNS `.local` name here —
-it resolves over whichever path the resolver likes, and a two-machine setup with
-both Wi-Fi and Thunderbolt will silently give you the wrong one. Check the
-printed token names the address you expect before starting the other ranks, and
-check the interface counters afterwards (`netstat -ib`) if it matters.
+**`--bind` decides whether you are measuring a cable or using a cluster.** Pass
+exactly one address when you mean to *measure* a named link: the listener binds
+that address and advertises nothing else, so no other path can be selected and
+the table can only be about that cable.
+
+```
+studio-a$ mcclbench --rank 0 --world-size 2 --bind 169.254.152.222 ...
+studio-b$ mcclbench --rank 1 --world-size 2 --bind 169.254.23.203 ...
+```
+
+Pass several — or none, which auto-discovers — when you mean to *use* whatever
+the machines share. This is what a mixed fabric needs, because there is no single
+address per rank that all of its peers can reach:
+
+```
+studio-a$ mcclbench --rank 0 --world-size 3 \
+                    --bind 169.254.152.222,192.168.1.250 --token-file /tmp/mix.id
+studio-b$ mcclbench --rank 1 --world-size 3 \
+                    --bind 169.254.23.203,192.168.1.238 --token '<token>'
+laptop$   mcclbench --rank 2 --world-size 3 --token '<token>'
+```
+
+Never use an mDNS `.local` name — it resolves over whichever path the resolver
+likes, and a machine with both Wi-Fi and Thunderbolt will silently give you the
+wrong one.
+
+**Then check what was actually chosen, rather than assuming.** Every rank prints
+its paths on stderr at bring-up:
+
+```
+mcclbench: rank 0 paths: 1=169.254.23.203:49247 2=192.168.1.135:61409
+mcclbench: rank 1 paths: 0=169.254.152.222:57404 2=192.168.1.135:61420
+mcclbench: rank 2 paths: 0=192.168.1.250:57404 1=192.168.1.238:49245
+```
+
+0↔1 on Thunderbolt, everything else on the LAN. A table from a world whose paths
+you have not checked says nothing about the fabric you think it describes.
+(`netstat -ib` on the interface counters is still a good second opinion.)
 
 **Give every rank the same grid.** The sweep must be identical on every rank or
 they walk different points and block on each other. It is fingerprinted and
@@ -1831,36 +1981,33 @@ collectives. The wire format is already versioned (`WireHeader.version`) and the
 frame tags are namespaced, so a richer protocol can be added without breaking the
 existing one.
 
-### Non-blocking C calls
+### Non-blocking C calls — partly built
 
-**What exists:** every exported symbol runs the collective to completion via
-`runBlocking` in `Sources/MCCLShim/CABI.swift`, which parks the calling thread on
-a `DispatchSemaphore` while a detached `Task` drives the async Swift API. The
-Swift surface underneath is already `async`, and each `Communicator` already runs
-its collectives on its own serial `workQueue`, so the machinery for overlap is
-present — the C ABI simply does not expose it.
+**What exists:** `mcclAllReduceAsync`, `mcclAllReduceCompressedAsync`,
+`mcclRequestWait` and `mcclRequestTest`, documented above under
+[§ Non-blocking all-reduce](#non-blocking-all-reduce). The Swift side is
+`Communicator.allReduceAsync` returning a `CollectiveRequest`, which puts the
+operation on the communicator's existing serial `workQueue` synchronously at
+issue — that synchronous enqueue is what preserves issue order across requests,
+and dispatching through a detached `Task` instead would let two issues race into
+the queue in either order.
 
-**What genuine non-blocking calls need:**
+**What is left:**
 
-1. **A real `mcclStream_t`.** Today it is an opaque integer naming a *sequence*
-   (which is all top-k's residual needs). An execution context would be a handle
-   owning a queue of pending operations and a completion mechanism —
-   `mcclStreamCreate` / `mcclStreamSynchronize` / `mcclStreamDestroy`.
-2. **`mcclGroupStart` / `mcclGroupEnd`.** NCCL's batching primitive: collectives
+1. **The other four collectives.** All-gather, broadcast, reduce and
+   reduce-scatter are blocking-only. Adding them is mechanical:
+   `Communicator.enqueue` in `Sources/MCCL/CollectiveRequest.swift` takes any
+   throwing closure, so each one is a wrapper plus a C export plus the buffer
+   contract already stated for all-reduce.
+2. **Concurrency between collectives.** A communicator's serial queue means two
+   outstanding requests run one after the other. Running them genuinely at once
+   would need per-stream queues *and* a guarantee that every rank interleaves
+   them identically — which is a protocol change, not a scheduling change, and
+   should not be attempted without one.
+3. **`mcclGroupStart` / `mcclGroupEnd`.** NCCL's batching primitive: collectives
    enqueued between them are fused into one launch. Without a device queue there
-   is nothing to fuse *into*, which is why it is not there.
-3. **Buffer ownership across the return.** The blocking design is what makes
-   `Borrowed` safe (see its comment in `CABI.swift`): the C caller cannot free
-   the memory underneath a collective that has already returned. Non-blocking
-   calls need an explicit contract — the caller must not touch the buffers until
-   `mcclStreamSynchronize`.
-4. **Error delivery after the fact.** `mcclGetLastError(comm)` is per
-   communicator and is written on the failing call. Deferred failures need to be
-   reported at synchronise time instead.
-
-This is the item most worth waiting on: it is only clearly worth the complexity
-once there is a Metal command queue to enqueue against, and mccl deliberately
-has no device queue in v0.
+   is nothing to fuse *into*, which is why it is still not there. This is the
+   piece genuinely worth waiting on a Metal command queue for.
 
 ---
 
