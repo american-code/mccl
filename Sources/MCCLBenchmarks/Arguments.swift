@@ -49,6 +49,12 @@ public enum BenchArguments {
                              (default 134217728)
       --quick                1 KiB .. 1 MiB, ring and tree only
       --csv                  machine-readable output
+      --codec-bench          measure the codec kernels alone — no ranks, no
+                             sockets — and print each codec's encode/decode
+                             ceiling in payload GB/s. This is the machine half
+                             of the rule in docs/ARCHITECTURE.md §Measured: a
+                             codec pays only where the fabric's uncompressed
+                             all-reduce rate is below the codec's own ceiling.
       --help                 this text
 
     DISTRIBUTED OPTIONS (one process per rank, one rank per machine)
@@ -153,6 +159,8 @@ public enum BenchArguments {
                 options.algorithms = [.ring, .tree]
             case "--csv":
                 options.csv = true
+            case "--codec-bench":
+                options.codecBench = true
 
             // Distributed mode. Any one of these switches it on.
             case "--distributed":
@@ -196,6 +204,10 @@ public enum BenchArguments {
         }
 
         if isDistributed {
+            guard !options.codecBench else {
+                throw ParseError(message: "--codec-bench measures this machine's codec kernels; "
+                                 + "there is no world to join")
+            }
             guard distributed.worldSize > 1 else {
                 throw ParseError(message: "--world-size must be at least 2")
             }

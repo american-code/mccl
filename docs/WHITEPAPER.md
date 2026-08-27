@@ -14,11 +14,17 @@ byte thresholds: we give the closed-form ring/tree crossover
 `S* = α·B·(log₂n − (n−1)) / ((n−1)/n − log₂n)` and show it is the only size
 threshold in the implementation. Third, that top-k sparsification is an algorithm
 rather than a per-hop codec, because applying it per hop introduces a bias error
-feedback cannot repair. We report a first real-hardware validation on two Mac
-Studio M1 Max machines over a direct Thunderbolt cable — 1.06 GB/s and 167.8 µs
-against a 20 Gb/s negotiated link — and a correctness evaluation of 190 tests at
-90.34% region coverage. Evaluation of the collectives themselves remains
-loopback-only; we say what that does and does not establish.
+feedback cannot repair. We report a real-hardware evaluation on two Mac Studio
+M1 Max machines over a direct Thunderbolt cable — 1.06 GB/s and 167.8 µs against
+a 20 Gb/s negotiated link, and an all-reduce reaching 70.4% of that — together
+with a measured rule for when in-band compression pays: *only when the fabric's
+uncompressed all-reduce rate is below the codec's own encode/decode ceiling*.
+That rule made a falsifiable prediction, which we then tested by vectorising the
+encoders: two of the three codecs cleared the cable's rate and flipped from
+losing 20–45% to winning 1.1–1.7×, while the third, whose ceiling stayed below
+the cable, stayed a loss. Correctness is evaluated by 232 tests at 90.56% region
+coverage, including byte-level interoperation between the vectorised and scalar
+encoders.
 
 ---
 
@@ -395,6 +401,8 @@ be a handful of vector instructions. Vectorising the codecs is the single change
 that would flip this verdict on Thunderbolt, and this table is the argument for
 making it.
 
+§5.1b takes that prediction and runs it.
+
 One expectation also failed. With n = 2 the ring and the binomial tree move the
 same total bytes, and were expected to be equivalent; they are not. Over four
 paired runs the ring beat the tree by 1.16× at 1 MiB and 1.72× at 16 MiB
@@ -412,9 +420,83 @@ per point is the slowest rank's, agreed with a one-element max all-reduce; a
 barrier separates each point's warm-up from its timed region. Full tables in
 [ARCHITECTURE.md § Measured: 2-node Thunderbolt](ARCHITECTURE.md#measured-2-node-thunderbolt).
 
+### 5.1b Vectorising the codecs, and testing the prediction it was made to test
+
+§5.1a ends with a falsifiable claim: the codecs lose on Thunderbolt because their
+scalar encode/decode ceilings sit below what the cable delivers, so lifting a
+codec's ceiling above that rate should flip it to a win. This section reports the
+experiment. The change under test is `CodecKernels`, a vector implementation of
+the same wire formats — byte-for-byte the same frames, checked in both directions
+against a copy of the original scalar loops (§5.2).
+
+**Measuring the ceiling instead of inferring it.** The ceilings in §5.1a were read
+off the plateau of a distributed sweep, which conflates the codec with everything
+else in a compressed call. `mcclbench --codec-bench` now measures the kernels
+directly, in payload GB/s, through the same code path a ring step runs. The first
+result is a correction to §5.1a: the scalar `downcast` kernel on an *idle* M1 Max
+runs at 3.67 GB/s round-trip, five times the cable, not 0.50. The low figures
+belong to `lab-01`, which shares its machine with an inference workload and, as
+the slower rank, sets the reported time. Its scalar ceilings are 0.89 (downcast),
+0.21 (int8/256), 0.19 (topk/0.01) GB/s — and the compressed plateaus of §5.1a
+land at ~56% of those, the remainder being sockets, framing and reduction. The
+rule was right; the constants attached to it were a property of one busy node.
+
+**Round-trip ceilings, scalar → vectorised**, best point per codec:
+
+| codec | M1 Pro | M1 Max, idle | M1 Max, shared (the rank that gates the run) |
+|---|---|---|---|
+| downcast | 3.55 → 36.89 | 3.67 → 31.80 | 0.89 → **10.79** |
+| int8/256 | 0.57 → 5.96 | 0.61 → 6.41 | 0.21 → **1.69** |
+| topk/0.01 | 0.76 → 1.47 | 0.93 → 1.62 | 0.19 → **0.36** |
+
+**The verdict flips for two codecs out of three.** 32 scalar and 28 vectorised
+sweeps, run alternately in one session because the shared machine's load moved by
+more than the effect under test. The paired statistic — each codec against `none`
+*within* the same sweep, median over sweeps — is the one that survives that drift:
+
+| size | downcast scalar → vector | int8/256 scalar → vector | topk/0.01 scalar → vector |
+|---|---|---|---|
+| 64 KiB | 1.01× → **1.17×** | 0.74× → **1.27×** | 1.25× → **1.92×** |
+| 1 MiB | 0.79× → **1.41×** | 0.55× → **1.40×** | 0.69× → 0.88× |
+| 16 MiB | 1.04× → **1.53×** | 0.80× → **1.70×** | 0.82× → 1.15× |
+| 64 MiB | 0.97× → **1.52×** | 0.76× → **1.71×** | 0.79× → 1.04× |
+
+`downcast` and `int8/256`, whose ceilings cleared the 0.53–0.66 GB/s the cable
+delivers uncompressed, now win at every size. `topk/0.01`, whose ceiling improved
+by a genuine 1.9× and remains *below* that rate, still loses at bandwidth-bound
+sizes while still winning at 64 KiB where the run is latency-bound. One experiment,
+the rule confirmed from both sides.
+
+A second prediction falls out and is also visible in the table: past the crossover
+a codec's rate stops mattering and only its ratio does. `int8/256` costs six times
+the CPU of `downcast` and beats it, because it puts 3.94× fewer bytes on the wire
+against downcast's 2.00×. The Wi-Fi sweep shows the same regime from further
+along — with vectorised codecs the speed-ups converge on the wire reductions
+themselves: downcast 1.99× of a possible 2.00×, int8 3.88× of 3.94×, topk 5.5×.
+
+**What made the codecs slow was not the absence of intrinsics.** The dominant cost
+was a runtime stride: `WireCodec.encode` indexed with `i * width`, where `width`
+comes from the dtype at run time, and read every element through a per-element
+dtype switch, so no loop had a compile-time-constant stride or element type to
+vectorise. With the fp32 stride fixed, the *plain* fp16 conversion loop
+auto-vectorises to 50–80 GB/s and beats every hand-written SIMD spelling tried;
+`SIMD8<Float>(SIMD8<Float16>)` in fact lowers to eight scalar converts (4.8 GB/s).
+Explicit SIMD earns its keep only in the int8 scan and top-k's residual fold, and
+there two standard-library conveniences must be avoided because neither vectorises
+today — `clamped`/`pointwiseMin`/`pointwiseMax` (2.2 GB/s against 19 GB/s for the
+same clamp via `replace(with:where:)`) and every float→integer SIMD conversion
+(0.2 GB/s), which is why the quantiser prepares floats in SIMD and hands the
+narrowing to `vDSP_vfix8`. Top-k gains least because its cost is selection
+traffic, not arithmetic: five passes over the tensor whatever the instruction set.
+
+**The wire is unchanged**, measured rather than asserted: five 64 MiB collectives
+per codec moved 336.3 / 168.1 / 85.3 / 6.7 MB across `lab-01`'s `en4` counters
+under the vectorised build, against 336.1 / 168.1 / 85.3 / 6.7 MB under the
+scalar one.
+
 ### 5.2 Correctness
 
-The test suite is 210 tests across 15 suites, all passing, run with
+The test suite is 232 tests across 17 suites, all passing, run with
 `swift test`:
 
 | suite | tests | what it covers |
@@ -426,7 +508,9 @@ The test suite is 210 tests across 15 suites, all passing, run with
 | TopKTests | 17 | selection, block layout, residuals, convergence |
 | TCPTransportTests | 15 | socket error paths: bind, resolve, hang-up |
 | CShimTests | 13 | the C ABI, incl. a compiled four-rank C client |
+| CodecBenchmarkTests | 10 | the codec-throughput mode and the ceilings it derives |
 | CompressionTests | 12 | codec round-trips within their error bounds |
+| CompressionInteropTests | 12 | vectorised frames against the scalar reference, both directions |
 | FabricTests | 12 | mesh bring-up failures, plan sanitising |
 | RendezvousProtocolTests | 11 | forged and malformed rendezvous frames |
 | RendezvousTests | 11 | token encoding, address exchange, `join` |
@@ -453,9 +537,9 @@ Coverage, regenerated with `swift test --enable-code-coverage` and `llvm-cov`:
 
 | metric | covered |
 |---|---|
-| region | **90.33%** (210 of 2171 regions missed) |
-| function | **94.12%** (34 of 578 missed) |
-| line | **97.11%** (124 of 4284 missed) |
+| region | **90.56%** (224 of 2373 regions missed) |
+| function | **94.43%** (35 of 628 missed) |
+| line | **97.05%** (141 of 4783 missed) |
 
 The lowest files are `Collectives.swift` (87.07% region) and `DataType.swift`
 (86.15%), where the residue is dtype × op × plan combinations covered
@@ -550,11 +634,20 @@ discovery, no membership change, no recovery from a rank restarting. Discovery
 (mDNS, with interface enumeration already in place) and a durable coordinator are
 additive; membership change and reconnection would reach into the collectives.
 
-**The C calls all block, and the reduction kernels are scalar loops.** A genuine
-`mcclStream_t` execution context with `mcclGroupStart`/`mcclGroupEnd` batching
-waits on there being a device queue worth enqueueing onto; vectorised kernels
-wait on the interconnect ceasing to be the bottleneck, which
-`mcclbench --transport loopback` is the instrument for detecting.
+**The C calls all block, and the reduction kernels are still scalar loops.** A
+genuine `mcclStream_t` execution context with `mcclGroupStart`/`mcclGroupEnd`
+batching waits on there being a device queue worth enqueueing onto. The *codecs*
+are no longer scalar (§5.1b), and that turned out to matter more than expected:
+`Kernels.reduce` and `Kernels.scale` carry the same runtime stride and
+per-element dtype switch that cost the encoders an order of magnitude, and the
+same fix applies. Reduction runs once per received chunk against the codec's
+twice per call, so the ceiling it caps is `none`'s rather than a codec's.
+
+**Compression is still a caller's flag, and should not be.** §5.1b leaves the
+library in a state where two codecs win on Thunderbolt and one loses, which is a
+decision the planner has the data to make and the caller usually does not: the
+probe measures the fabric, `mcclbench --codec-bench` measures the machine, and
+the rule connecting them is one comparison. Nothing in the API expresses it yet.
 
 **An open research question.** Because mccl knows the exact partition boundaries
 and the compression error introduced at each hop, it can emit ground truth for a
@@ -581,10 +674,13 @@ error-feedback argument does not hold.
 The implementation is complete enough to evaluate: all five collectives across
 five dtypes and five reductions, three executable plans, three wire codecs, a
 probe, a planner, a C ABI validated by a compiled C client, and a benchmark
-harness — 190 tests at 90.34% region coverage, no external dependencies. The
+harness — 232 tests at 90.56% region coverage, no external dependencies. The
 first real-hardware measurement puts a direct Thunderbolt link at 1.06 GB/s and
 167.8 µs, 42.4% of its negotiated line rate, with both paths between the machines
-correctly classified.
+correctly classified. On that link the compression rule of §5.1a has now been
+tested rather than merely stated: vectorising the encoders lifted two codecs'
+ceilings above the fabric's rate and both flipped from losing to winning, while
+the third stayed below it and stayed a loss.
 
 What is not established is the claim the design rests on: that a measured-topology
 planner with wire compression beats a fixed ring on a real mixed-speed Mac

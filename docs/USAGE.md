@@ -1034,12 +1034,59 @@ mcclbench --ranks 8 --collective allgather --codecs none,int8:128 --csv
 | `--budget <n>` | 134217728 | bytes to move per point; sets the iteration count |
 | `--quick` | — | 1 KiB .. 1 MiB, ring and tree only |
 | `--csv` | — | machine-readable output |
+| `--codec-bench` | — | measure the codec kernels alone, no ranks and no sockets |
 | `--help` | — | usage text |
 
 Codecs that cannot apply to a point are skipped rather than reported as
 failures: `downcast` needs fp32, `int8` needs a floating-point dtype, and `topk`
 is all-reduce-only on a floating-point dtype. `--transport loopback` isolates
 codec and kernel cost from the socket.
+
+### What a codec costs this machine
+
+`--codec-bench` answers the local half of "is compression worth switching on?".
+It runs the same `WireCodec` and top-k kernels a ring step runs — no world, no
+sockets — and reports payload bytes per second for the sending half, the
+receiving half, and the two in series:
+
+```
+$ mcclbench --codec-bench --ranks 2 --sizes 1M,16M
+
+mccl codec throughput — fp32, 2 ranks assumed for top-k's receive side
+host: lab-02.local, Apple M1 Max
+payload GB/s: the caller's bytes through the codec, best of 5
+
+        size  codec            ratio    GB/s enc    GB/s dec    GB/s r/t    ns/elem
+-----------------------------------------------------------------------------------
+       1 MiB  none             1.00x      60.996      55.159      28.966       0.14
+       1 MiB  downcast         2.00x      62.751      61.708      31.113       0.13
+       1 MiB  int8/256         3.94x       7.798      31.871       6.265       0.64
+       1 MiB  topk/0.01       49.98x       1.015      75.796       1.002       3.99
+      16 MiB  none             1.00x      48.370      32.114      19.300       0.21
+      16 MiB  downcast         2.00x      47.731      56.916      25.960       0.15
+      16 MiB  int8/256         3.94x       7.964      32.796       6.408       0.62
+      16 MiB  topk/0.01       50.00x       1.649      62.625       1.606       2.49
+
+ceiling per codec (best round-trip point)
+  none          30.684 GB/s     at 256 KiB
+  downcast      31.804 GB/s     at 256 KiB
+  int8/256      6.411 GB/s      at 64 MiB
+  topk/0.01     1.621 GB/s      at 64 MiB
+```
+
+`GB/s r/t` is the ceiling to compare against a fabric, because a ring all-reduce
+at n = 2 encodes one payload and decodes one payload per call. `--ranks` matters
+only to top-k, whose receiving half sums one block per rank. Run it on the
+*slowest* machine in the world: the collective reports the slowest rank's time,
+so that node's ceiling is the one that decides.
+
+Then apply the rule: **a codec pays only when the fabric's uncompressed
+all-reduce rate is below that codec's round-trip ceiling.** On the machine above,
+`downcast` at 31.8 GB/s and `int8/256` at 6.4 GB/s clear a 0.7 GB/s Thunderbolt
+cable by a wide margin and both win there; `topk/0.01` at 1.6 GB/s clears it too
+on this idle machine but not on the shared one that actually gates the run, which
+is why it still loses. Measured tables:
+[ARCHITECTURE.md § Measured: vectorised codecs](ARCHITECTURE.md#measured-vectorised-codecs).
 
 ### Across machines
 
@@ -1150,14 +1197,17 @@ magnitude faster than a 10GbE or TB5 hop. So every codec pays its full encode
 cost and buys back nothing, and `int8` duly comes last. What the table gives you
 is each codec's CPU price per byte.
 
-That price turned out to decide the question. Measured across two Mac Studios on
-a 1.06 GB/s Thunderbolt cable, every codec *loses*: `downcast` halves the bytes
-on the wire and is still 25–32% slower than fp32, because the scalar encoder tops
-out around 0.50 GB/s of payload — below what the cable delivers uncompressed.
-Over Wi-Fi at 0.05 GB/s the same codecs win by 1.9–5.4×. The rule: **a codec pays
-only when the fabric's uncompressed all-reduce rate is below that codec's own
-encode/decode ceiling.** Full tables in
-[ARCHITECTURE.md § Measured: 2-node Thunderbolt](ARCHITECTURE.md#measured-2-node-thunderbolt).
+That price turned out to decide the question, and it moved once the encoders were
+vectorised. The rule is stable: **a codec pays only when the fabric's uncompressed
+all-reduce rate is below that codec's own encode/decode ceiling.** What changed is
+which side of it each codec sits on. With the scalar encoders, every codec lost on
+a 1.06 GB/s Thunderbolt cable (`downcast` halved the wire bytes and was still
+25–32% slower than fp32). With the vectorised ones, `downcast` wins by 1.07–1.53×
+and `int8/256` by 1.27–1.71× on the same cable, while `topk/0.01` — whose ceiling
+rose 1.9× and is still below what the cable delivers — remains a loss above
+64 KiB. Over Wi-Fi at 0.05 GB/s every codec wins either way, now by close to its
+full wire reduction. Measure your own machine with `--codec-bench`; full tables in
+[ARCHITECTURE.md § Measured: vectorised codecs](ARCHITECTURE.md#measured-vectorised-codecs).
 
 The same caution applies to the algorithm columns: over loopback the tree's
 `O(log n)` hop advantage is worth much less than it would be across four

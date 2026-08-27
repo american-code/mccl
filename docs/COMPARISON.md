@@ -17,7 +17,7 @@ Sources: [nccl-tests #149](https://github.com/NVIDIA/nccl-tests/issues/149),
 [nccl #450](https://github.com/NVIDIA/nccl/issues/450),
 [nccl #209](https://github.com/NVIDIA/nccl/issues/209).
 
-## mccl measured (2-node Thunderbolt, fp32 sum all-reduce, ring, best of 5)
+## mccl measured (2-node Thunderbolt, fp32 sum all-reduce, ring, best of 5, scalar codecs)
 
 Probe-measured achievable link: 1.06 GB/s (42% of the 20 Gb/s line — the IP-over-TB
 stack tax, paid before mccl runs).
@@ -41,11 +41,37 @@ NCCL has no in-band lossy compression. mccl does, with exact wire-byte accountin
 bytes), and the measured rule for when it pays:
 
 **A codec pays only when the fabric's uncompressed all-reduce rate is below the codec's
-own encode/decode ceiling** (measured scalar-Swift ceilings on M1 Max: downcast
-~0.50 GB/s, topK ~0.28, int8 ~0.16). On the ~1 GB/s TB link every codec loses; on the
-0.05 GB/s WiFi path every codec wins — topK by 5.4×, downcast at 1.89× of its
-theoretical 2.00×. Vectorizing the scalar encoders raises the ceilings and moves the
-crossover onto faster fabrics.
+own encode/decode ceiling.**
+
+The rule was stated from the scalar encoders, whose ceilings all sat below what the
+cable delivers, so every codec lost on Thunderbolt and every codec won on Wi-Fi. That
+made a falsifiable prediction — lift the ceilings and the Thunderbolt verdict should
+flip — and vectorising the encoders tested it. Ceilings are round-trip payload GB/s,
+measured directly with `mcclbench --codec-bench` on the rank that gates the
+collective:
+
+| codec | ceiling, scalar | ceiling, vectorised | TB verdict, scalar | TB verdict, vectorised |
+|---|---|---|---|---|
+| downcast | 0.89 GB/s | **10.79 GB/s** | 0.79–1.04× (loses) | **1.07–1.53× (wins)** |
+| int8/256 | 0.21 GB/s | **1.69 GB/s** | 0.51–0.80× (loses) | **1.27–1.71× (wins)** |
+| topK/0.01 | 0.19 GB/s | 0.36 GB/s | 0.69–1.25× (loses) | 0.72–1.15× (still loses) |
+
+**The prediction held.** The two codecs whose ceilings cleared the fabric's 0.53–0.66
+GB/s uncompressed rate flipped to wins; top-k, whose ceiling rose 1.9× and stayed
+*below* the fabric, stayed a loss — the same rule, confirmed from both sides in one
+experiment. Past the crossover the ranking changes too: `int8` costs six times the
+CPU of `downcast` and now beats it, because once both clear the fabric only the
+compression ratio matters, and int8 saves 3.94× the bytes against downcast's 2.00×.
+
+On the 0.05 GB/s Wi-Fi path every codec still wins, and now collects almost exactly
+its wire reduction — downcast 1.99× of a theoretical 2.00×, int8 3.88× of 3.94×,
+topK 5.5×.
+
+Also worth recording as a correction: the scalar ceilings originally quoted here
+(~0.50/0.28/0.16 GB/s) were read off a distributed sweep's plateau, not measured. The
+scalar kernels on an *idle* M1 Max run at 3.67 GB/s for downcast; the low figures
+belong to the shared node that gates the collective. The rule survived the
+correction, the numbers attached to it did not.
 
 Also measured against naive theory: at n=2 the ring beats the tree by up to 1.72× —
 same bytes, but the ring is full-duplex while the tree serializes through the root.

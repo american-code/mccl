@@ -569,22 +569,15 @@ extension Communicator {
         let width = dataType.byteWidth
         let base = buffer.baseAddress!
 
-        // 1. Fold the residual back in.
+        // 1. Fold the residual back in. 2. Select, send the selection, keep the
+        //    rest. Both live in `TopKKernels.encodeBlock`, so the benchmark's
+        //    codec probe measures exactly the code the collective runs.
         var work = residuals.load(stream, count: count)
-        var magnitudes = [Float](repeating: 0, count: count)
-        for i in 0..<count {
-            let value = ElementIO.loadFloat(base, byteOffset: i * width, dataType) + work[i]
-            work[i] = value
-            magnitudes[i] = value.isFinite ? abs(value) : 0
-        }
-
-        // 2. Select, send the selection, keep the rest.
         let k = TopK.count(elementCount: count, fraction: fraction)
-        let selected = TopK.selectIndices(magnitudes: magnitudes, k: k)
-        let blockBytes = TopKBlock.byteCount(nonZeros: selected.count, valueWidth: width)
+        let blockBytes = TopKBlock.byteCount(nonZeros: k, valueWidth: width)
         let block = ScratchBuffer(capacity: blockBytes)
-        TopKBlock.write(indices: selected, values: work, dataType: dataType, into: block.base)
-        for index in selected { work[index] = 0 }
+        TopKKernels.encodeBlock(source: base, count: count, dataType: dataType,
+                                fraction: fraction, residual: &work, into: block.base)
         residuals.store(stream, work)
 
         // 3. Gather every rank's block and sum them. The blocks are uniform in

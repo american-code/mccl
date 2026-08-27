@@ -44,7 +44,12 @@ func emit(_ line: String) {
 
 if !options.csv, isReporter {
     let identity = NodeIdentity.local()
-    if let distributed {
+    if options.codecBench {
+        print("mccl codec throughput — \(options.dataType), \(options.worldSize) ranks assumed for "
+              + "top-k's receive side")
+        print("host: \(identity.hostname), \(identity.chip)")
+        print("payload GB/s: the caller's bytes through the codec, best of 5")
+    } else if let distributed {
         print("mccl benchmark — \(options.collective.rawValue), \(distributed.worldSize) ranks over "
               + "\(distributed.label.map { "\($0), " } ?? "")distributed tcp, "
               + "\(options.dataType), op \(options.op)")
@@ -83,7 +88,26 @@ func summarise(_ rows: [BenchRow]) {
     }
 }
 
-if let distributed {
+if options.codecBench {
+    // Codec throughput: no ranks, no sockets, no cable. Just what this chip
+    // costs per byte to encode and decode, which is the term the compression
+    // rule compares the fabric's rate against.
+    print(CodecBenchTable.header(options))
+    if let rule = CodecBenchTable.rule(options) { print(rule) }
+    let rows = CodecBenchRunner.run(options) { row in
+        print(CodecBenchTable.render(row, options: options))
+        fflush(stdout)
+    }
+    if !options.csv {
+        print("")
+        print("ceiling per codec (best round-trip point)")
+        for entry in CodecBenchTable.ceilings(rows) {
+            print("  \(BenchTable.pad(entry.codec, 14))"
+                  + "\(BenchTable.pad(String(format: "%.3f GB/s", entry.ceiling / 1e9), 16))"
+                  + "at \(BenchTable.bytes(entry.at))")
+        }
+    }
+} else if let distributed {
     // Distributed: join a real world and sweep the same grid. The header waits
     // until the world is up, because a token line has to reach the launcher
     // before rank 1 can be started.

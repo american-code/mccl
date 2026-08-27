@@ -78,29 +78,35 @@ struct WireCodec {
             return n
 
         case .fp16Downcast:
-            for i in 0..<elementCount {
-                let v = src.loadUnaligned(fromByteOffset: i * width, as: Float.self)
-                dst.storeBytes(of: Float16(v), toByteOffset: i * 2, as: Float16.self)
-            }
+            // The codec id is only ever chosen for fp32 (see `init`), so the
+            // stride is known and the kernel can be a straight vector loop.
+            CodecKernels.encodeFP16(from: src, count: elementCount, into: dst)
             return elementCount * 2
 
         case .int8Blockwise:
             let blocks = (elementCount + blockSize - 1) / blockSize
             let codesOffset = blocks * MemoryLayout<Float>.size
+            let vectorable = dataType == .float32
             for b in 0..<blocks {
                 let start = b * blockSize
                 let end = min(start + blockSize, elementCount)
+                let span = end - start
                 var absmax: Float = 0
-                for i in start..<end {
-                    let v = abs(ElementIO.loadFloat(src, byteOffset: i * width, dataType))
-                    if v.isFinite, v > absmax { absmax = v }
+                if vectorable {
+                    absmax = CodecKernels.absmaxFP32(src + start * 4, count: span)
+                } else {
+                    for i in start..<end {
+                        let v = abs(ElementIO.loadFloat(src, byteOffset: i * width, dataType))
+                        if v.isFinite, v > absmax { absmax = v }
+                    }
                 }
                 let scale = absmax / 127.0
                 dst.storeBytes(of: scale, toByteOffset: b * MemoryLayout<Float>.size, as: Float.self)
                 if scale == 0 {
-                    for i in start..<end {
-                        dst.storeBytes(of: Int8(0), toByteOffset: codesOffset + i, as: Int8.self)
-                    }
+                    memset(dst + codesOffset + start, 0, span)
+                } else if vectorable {
+                    CodecKernels.quantizeFP32(src + start * 4, count: span, inverseScale: 1.0 / scale,
+                                              into: dst + codesOffset + start)
                 } else {
                     let inv = 1.0 / scale
                     for i in start..<end {
@@ -142,10 +148,7 @@ struct WireCodec {
             guard dataType == .float32 else {
                 throw MCCLError.protocolViolation("fp16 downcast frame decoded as \(dataType)")
             }
-            for i in 0..<elementCount {
-                let h = payload.loadUnaligned(fromByteOffset: i * 2, as: Float16.self)
-                dst.storeBytes(of: Float(h), toByteOffset: i * width, as: Float.self)
-            }
+            CodecKernels.decodeFP16(from: payload, count: elementCount, into: dst)
 
         case .int8Blockwise:
             guard blockSize > 0 else { throw MCCLError.protocolViolation("int8 frame with blockSize 0") }
@@ -155,10 +158,16 @@ struct WireCodec {
                 throw MCCLError.protocolViolation(
                     "int8 payload \(payloadBytes) != expected \(codesOffset + elementCount)")
             }
+            let vectorable = dataType == .float32
             for b in 0..<blocks {
                 let scale = payload.loadUnaligned(fromByteOffset: b * MemoryLayout<Float>.size, as: Float.self)
                 let start = b * blockSize
                 let end = min(start + blockSize, elementCount)
+                if vectorable {
+                    CodecKernels.dequantizeFP32(payload + codesOffset + start, count: end - start,
+                                                scale: scale, into: dst + start * 4)
+                    continue
+                }
                 for i in start..<end {
                     let code = payload.loadUnaligned(fromByteOffset: codesOffset + i, as: Int8.self)
                     ElementIO.storeFloat(Float(code) * scale, into: dst, byteOffset: i * width, dataType)

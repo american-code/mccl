@@ -40,22 +40,32 @@ training framework.
 Milestones 1–4 are implemented and tested; milestone 5 is partial — the C shim
 and the benchmark harness are in, the MLX adapter is not.
 
-**210 tests, all passing**, at 90.33% region / 94.12% function / 97.11% line
+**232 tests, all passing**, at 90.56% region / 94.43% function / 97.05% line
 coverage. First real-hardware validation: two Mac Studio M1 Max
 machines on a direct Thunderbolt cable negotiated at 20 Gb/s probed at **1.06 GB/s
 and 167.8 µs**, with the Thunderbolt and Wi-Fi paths correctly classified from
 interface media.
 
-Collective throughput is now measured on that cable rather than only over loopback.
+Collective throughput is measured on that cable rather than only over loopback.
 `mcclbench` runs distributed (`--rank` / `--world-size`, joining through a rendezvous
 token), and a 2-node all-reduce reaches **0.746 GB/s bus bandwidth at 16 MiB — 70.4%
-of the probed link**. The first real-interconnect codec verdict came out against the
-codecs: `downcast` halves the bytes on the wire (verified at the interface counter)
-and is still 25–32% *slower* than sending fp32, because the scalar encoder tops out
-at ~0.5 GB/s, below what the cable delivers uncompressed. Over Wi-Fi at 0.05 GB/s the
-same codecs win by 1.9–5.4×. See
-[ARCHITECTURE.md § Measured: 2-node Thunderbolt](docs/ARCHITECTURE.md#measured-2-node-thunderbolt)
-for the tables and the rule they imply.
+of the probed link**. That sweep produced the rule the codecs are governed by — *a
+codec pays only when the fabric's uncompressed all-reduce rate is below the codec's
+own encode/decode ceiling* — and, with scalar encoders, a verdict against every
+codec on Thunderbolt.
+
+**The codecs are now vectorised, and the Thunderbolt verdict has flipped for two of
+the three.** `CodecKernels` produces byte-for-byte the same frames (checked against
+the scalar loops in both directions, and re-verified at the interface counters), at
+8–12× the throughput for `downcast` and `int8`, 1.9× for top-k. Re-run on the same
+cable against a same-session scalar control, `downcast` went from 0.79–1.04× to
+**1.07–1.53×** against uncompressed and `int8/256` from 0.51–0.80× to
+**1.27–1.71×**, while `topk/0.01` — the one codec whose ceiling is still below what
+the cable delivers — stayed a loss, exactly as the rule requires. Over Wi-Fi the
+codecs now collect almost their full wire reduction (downcast 1.99× of a possible
+2.00×, int8 3.88× of 3.94×). See
+[ARCHITECTURE.md § Measured: vectorised codecs](docs/ARCHITECTURE.md#measured-vectorised-codecs)
+for the tables, the method, and the ceilings measured per chip.
 
 **Working**
 
@@ -80,7 +90,8 @@ for the tables and the rule they imply.
   scale + int8 payload), and `.topK(fraction:)` with per-stream error feedback —
   each rank sends only its `k` largest-magnitude elements and carries the remainder
   forward, so a training run converges on the uncompressed answer instead of
-  drifting away from it.
+  drifting away from it. The encoders are vector code (`CodecKernels`) and remain
+  byte-compatible with the scalar frames, so a mixed-version world interoperates.
 - **C shim.** `libmccl.dylib` plus a hand-written
   [`Sources/MCCLShim/include/mccl.h`](Sources/MCCLShim/include/mccl.h), shaped like
   NCCL: `mcclGetUniqueId` / `mcclCommInitRank` / `mcclAllReduce` / `mcclAllGather` /
@@ -89,7 +100,9 @@ for the tables and the rule they imply.
   four-rank C client with `cc` and runs it against the built dylib.
 - **Benchmarks.** `mcclbench` sweeps ring vs. tree vs. hierarchical, with and without
   each codec, from 1 KiB to 64 MiB — in one process, or as one rank of a real
-  multi-machine world discovered through a rendezvous token.
+  multi-machine world discovered through a rendezvous token. `--codec-bench` drops
+  the ranks and the sockets and measures the codec kernels alone, which is the
+  local half of deciding whether compression is worth switching on.
 
 **Not yet**
 
@@ -247,12 +260,24 @@ has no wire: the "interconnect" is memory bandwidth, so every codec pays its enc
 and buys nothing back, and int8 duly comes last. What that table gives you is each
 codec's CPU price per byte.
 
-The cluster numbers are now in, and the price turned out to be the whole story. On a
-1.06 GB/s Thunderbolt cable `downcast` halves the bytes on the wire and is still 25–32%
-slower than fp32; on 0.05 GB/s Wi-Fi the same codec wins 1.9× and top-k wins 5.4×. A
-codec pays only when the fabric's uncompressed all-reduce rate falls below that codec's
-own encode/decode ceiling. See
-[ARCHITECTURE.md § Measured: 2-node Thunderbolt](docs/ARCHITECTURE.md#measured-2-node-thunderbolt).
+The cluster numbers are in, and the price was the whole story: a codec pays only when
+the fabric's uncompressed all-reduce rate falls below that codec's own encode/decode
+ceiling. `mcclbench --codec-bench` measures that ceiling directly, with no ranks and
+no sockets:
+
+```
+        size  codec            ratio    GB/s enc    GB/s dec    GB/s r/t    ns/elem
+-----------------------------------------------------------------------------------
+      16 MiB  none             1.00x      48.370      32.114      19.300       0.21
+      16 MiB  downcast         2.00x      47.731      56.916      25.960       0.15
+      16 MiB  int8/256         3.94x       7.964      32.796       6.408       0.62
+      16 MiB  topk/0.01       50.00x       1.649      62.625       1.606       2.49
+```
+
+Compare "GB/s r/t" against the fabric's uncompressed rate and the verdict follows.
+On a 1.06 GB/s Thunderbolt cable the scalar encoders lost that comparison and the
+vectorised `downcast` and `int8` win it; `topk` still does not. See
+[ARCHITECTURE.md § Measured: vectorised codecs](docs/ARCHITECTURE.md#measured-vectorised-codecs).
 
 Full flag reference and a longer discussion of alg vs. bus bandwidth:
 [USAGE.md § Benchmarking](docs/USAGE.md#benchmarking-with-mcclbench).

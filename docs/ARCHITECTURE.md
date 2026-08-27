@@ -97,6 +97,15 @@ is already done, and quantising an int32 accumulator would be wrong.
   (`4·⌈n/blockSize⌉ + n` bytes). Absolute error ≤ blockAbsmax/254.
 - `topK(fraction:)`: **not a per-hop codec** — it replaces the algorithm. See below.
 
+The kernels behind these live in `CodecKernels` and are vector code for `.float32`,
+the dtype the codecs exist for; other dtypes keep the scalar path. Vectorising was
+not allowed to move a single byte on the wire, so the fast encoders reproduce the
+scalar frames exactly — same fp16 rounding, same round-half-away-from-zero
+quantisation, same treatment of NaN and ±infinity, same block scales. A rank running
+one build interoperates with a rank running the other, which
+`CompressionInteropTests` checks against a copy of the original scalar loops rather
+than against itself.
+
 ### Top-k with error feedback
 
 Top-k is the one stateful thing in mccl. `Communicator` carries a `ResidualStore`: one
@@ -217,6 +226,13 @@ and to MLX's ring. Over loopback it is really measuring each codec's CPU price p
 since there is no wire to save; that number is what predicts where a codec starts
 winning on a link an order of magnitude slower than memory.
 
+`--codec-bench` drops the ranks and the sockets entirely and measures the codec
+kernels alone, in payload GB/s, through `CodecKernelProbe` — the same `WireCodec` and
+top-k code a ring step runs, so the ceiling it reports is the one the collective
+pays. That number is the machine half of the compression rule (§Measured), and it is
+a `mcclbench` mode rather than a test because the machines whose ceilings matter are
+lab nodes that run executables, not XCTest.
+
 `--rank` / `--world-size` switch it to *distributed* mode: the process becomes one rank
 of a real world, joining the others through the same `Rendezvous` token the C shim's
 `mcclCommInitRank` uses, and the table then describes an actual cable. Rank 0 creates
@@ -242,6 +258,14 @@ rank's stopwatch.
 
 The first collective throughput numbers from real interconnect, and the first verdict
 on the wire codecs that is not an extrapolation from loopback.
+
+> **This section records two runs.** Everything down to *Wi-Fi contrast* is the
+> original measurement of the **scalar** codecs. §*Measured: vectorised codecs* below
+> re-runs the same sweep after the encoders were vectorised, against a same-session
+> scalar control, and reverses the verdict on Thunderbolt for `downcast` and
+> `int8/256`. The scalar tables are kept rather than replaced: the prediction that
+> vectorising would flip the verdict was made from them, and a prediction is only
+> worth something next to the data that produced it.
 
 **Setup.** Two Mac Studio M1 Max (`lab-01`, `lab-02`) joined by a direct Thunderbolt
 cable, negotiated at 20 Gb/s, probed by `mcclprobe measure` at **1.06 GB/s and
@@ -383,6 +407,154 @@ single run, and why medians are recorded alongside in the raw output. The verdic
 sensitive to the choice: `none` beats every codec above 256 KiB on Thunderbolt in both
 the best-of and the median-of statistic, and loses to every codec on Wi-Fi in both.
 
+## Measured: vectorised codecs
+
+Same two machines, same cable, same sweep, later the same day. The change under test
+is `CodecKernels`: the encoders now run as vector code, byte-compatible with the
+scalar frames they replace (`CompressionInteropTests` checks that both ways).
+
+### What the scalar loops were actually doing
+
+`mcclbench --codec-bench` was added first, because the ceilings above were *inferred*
+from the plateau of a distributed sweep and had never been measured directly. It runs
+the real `WireCodec` and top-k kernels over one buffer with no ranks and no sockets,
+and reports payload bytes per second — `enc` for the sending half, `dec` for the
+receiving half, and `r/t` for `1/(1/enc + 1/dec)`, which is the rate a rank sustains
+when it is encoding what it sends and decoding what it receives. That last number is
+the "ceiling" the compression rule is stated against; a ring all-reduce at n = 2
+encodes exactly one payload and decodes exactly one per call, so the two are directly
+comparable.
+
+Round-trip ceiling, GB/s of payload, best point per codec:
+
+| codec | M1 Pro scalar → vector | M1 Max (`lab-02`, idle) scalar → vector | M1 Max (`lab-01`, shared) scalar → vector |
+|---|---|---|---|
+| none (memcpy) | 33.63 → 32.21 | 35.37 → 30.68 | 7.46 → 11.91 |
+| downcast | 3.55 → **36.89** (10.4×) | 3.67 → **31.80** (8.7×) | 0.89 → **10.79** (12.1×) |
+| int8/256 | 0.57 → **5.96** (10.4×) | 0.61 → **6.41** (10.5×) | 0.21 → **1.69** (8.2×) |
+| topk/0.01 | 0.76 → **1.47** (1.9×) | 0.93 → **1.62** (1.7×) | 0.19 → **0.36** (1.9×) |
+
+Two things in that table were not expected.
+
+**The scalar codecs were never as slow as ~0.50 GB/s.** On an idle M1 Max the scalar
+`downcast` kernel already ran at 3.67 GB/s round-trip — five times the cable. The
+0.50/0.28/0.16 figures above are what `lab-01` achieved, and `lab-01` runs EXO.app;
+its scalar ceilings measure 0.89/0.19/0.21. Since the reported wall time is the
+*slowest* rank's, the collective was gated by the loaded machine's codec rate, and
+the plateau landed at ~56% of that machine's kernel ceiling — the rest of a
+compressed call being socket, framing and reduction. So the rule was right and the
+number attached to it was a property of one busy node, not of the chip.
+
+**Vectorising is not mostly about intrinsics.** The largest single win was deleting a
+runtime stride: `WireCodec.encode` walked its buffer with `i * width`, where `width`
+comes from the dtype at run time, and `ElementIO` switched on the dtype once per
+element, so nothing in the loop was a compile-time constant and the vectoriser did
+nothing. With the fp32 stride known, the *plain* fp16 conversion loop auto-vectorises
+to 50–80 GB/s and beats every hand-written SIMD spelling tried — `SIMD8<Float16>`
+widening lowers to eight scalar converts (4.8 GB/s). Explicit SIMD earns its place
+only in the int8 scan and top-k's fold, and there two standard-library conveniences
+have to be avoided because neither vectorises: `clamped`/`pointwiseMin`/`pointwiseMax`
+(2.2 GB/s against 19 GB/s for the same clamp written with `replace(with:where:)`) and
+every float→integer SIMD conversion (0.2 GB/s), which is why the quantiser prepares
+floats in SIMD and hands the narrowing to `vDSP_vfix8`.
+
+Top-k gains the least, and for a structural reason: its cost is not arithmetic but
+the traffic of selection. Folding the residual, copying the magnitudes, partitioning
+them and collecting the winners is five-ish passes over the whole tensor whatever the
+instruction set. Partitioning magnitudes instead of an index permutation (one cache
+miss per comparison before) is most of the 1.9×.
+
+### All-reduce over the Thunderbolt cable, vectorised vs scalar
+
+Both binaries were run **alternately in the same session** — `mccl-scalar` is the
+previous commit built from `git archive HEAD` — because `lab-01`'s load moved by more
+than the effect under test while the sweeps ran (load average 4 → 29 → 15 over the
+hour; worst/best within a size reached 10×). 32 scalar and 28 vectorised complete
+sweeps. Bus bandwidth in GB/s, best of all sweeps, speed-up against `none` in
+parentheses:
+
+| size | none | downcast | int8/256 | topk/0.01 |
+|---|---|---|---|---|
+| 64 KiB | 0.135 | 0.143 (1.06×) | 0.144 (1.07×) | **0.229 (1.69×)** |
+| 256 KiB | 0.316 | **0.405 (1.28×)** | 0.403 (1.28×) | 0.352 (1.12×) |
+| 1 MiB | 0.460 | **0.570 (1.24×)** | 0.553 (1.20×) | 0.312 (0.68×) |
+| 4 MiB | 0.618 | 0.788 (1.27×) | **0.807 (1.31×)** | 0.336 (0.54×) |
+| 16 MiB | 0.662 | 0.625 (0.94×) | **0.834 (1.26×)** | 0.428 (0.65×) |
+| 64 MiB | 0.534 | **0.802 (1.50×)** | 0.596 (1.12×) | 0.355 (0.67×) |
+
+The honest statistic on a machine this noisy is not the best-of but the *paired*
+one: each sweep measures `none` and every codec within a few seconds of itself, so
+the ratio inside a sweep is immune to drift that the absolute column is not. Median
+within-sweep speed-up against `none`, over every sweep:
+
+| size | scalar downcast | vector downcast | scalar int8/256 | vector int8/256 | scalar topk | vector topk |
+|---|---|---|---|---|---|---|
+| 64 KiB | 1.01× | **1.17×** | 0.74× | **1.27×** | 1.25× | **1.92×** |
+| 256 KiB | 0.86× | **1.26×** | 0.51× | **1.34×** | 0.76× | 1.11× |
+| 1 MiB | 0.79× | **1.41×** | 0.55× | **1.40×** | 0.69× | 0.88× |
+| 4 MiB | 1.01× | **1.07×** | 0.71× | **1.50×** | 1.06× | 0.72× |
+| 16 MiB | 1.04× | **1.53×** | 0.80× | **1.70×** | 0.82× | 1.15× |
+| 64 MiB | 0.97× | **1.52×** | 0.76× | **1.71×** | 0.79× | 1.04× |
+
+### Verdict: the flip happened, for two codecs out of three
+
+> **`downcast` and `int8/256` now win on Thunderbolt at every size measured.**
+> `topk/0.01` does not, and the reason is the same rule seen from the other side.
+
+The prediction being tested was: *if vectorising lifts `downcast`'s ceiling well above
+the ~0.75 GB/s the cable delivers uncompressed, `downcast` should flip to a win at
+bandwidth-bound sizes.* It did. On the rank that gates the collective, `downcast`'s
+ceiling went from 0.89 GB/s — below the link — to 10.79 GB/s, fourteen times the
+link, and the codec went from 0.79–1.04× to 1.07–1.53× against uncompressed.
+
+`int8/256` flipped harder and now wins by more than `downcast` despite costing six
+times as much CPU, which is exactly what the rule predicts once *both* codecs are
+comfortably above the fabric: past that point the codec's rate stops mattering and
+only its compression ratio does, and int8 puts 3.94× fewer bytes on the wire against
+downcast's 2.00×. That is the regime the Wi-Fi table has always been in.
+
+`topk/0.01` is the control that keeps the rule honest. Its ceiling on `lab-01` rose
+from 0.19 to 0.36 GB/s — a real 1.9× and still *below* the 0.53–0.66 GB/s the cable
+delivers uncompressed. The rule says it should lose, and it does (0.54–1.15× at
+bandwidth-bound sizes), while continuing to win at 64 KiB where the run is
+latency-bound and the 49.9× smaller message shortens the round trips. Three codecs,
+one rule, and the two that cleared the fabric's rate flipped while the one that did
+not stayed lost.
+
+### The frames did not change
+
+Re-measured at `lab-01`'s `en4` counters, five 64 MiB collectives per codec, with the
+vectorised build:
+
+| codec | bytes out | vs. uncompressed | scalar build measured |
+|---|---|---|---|
+| none | 336.3 MB | 1.00× | 336.1 MB |
+| downcast | 168.1 MB | **2.00×** | 168.1 MB |
+| int8/256 | 85.3 MB | **3.94×** | 85.3 MB |
+| topk/0.01 | 6.7 MB | **49.9×** | 6.7 MB |
+
+Identical to the byte, which is the wire-compatibility claim measured on the cable
+rather than in a test. `CompressionInteropTests` makes the stronger version of it:
+the vectorised encoders produce byte-for-byte the frames the scalar encoders
+produced, including rounding ties and the treatment of NaN and ±infinity, and frames
+from either encoder decode identically through either decoder.
+
+### Wi-Fi re-check: the codecs now collect their full wire reduction
+
+The same sweep over the Wi-Fi interfaces (`192.168.1.250` ↔ `192.168.1.238`), best of
+three, vectorised:
+
+| size | none | downcast | int8/256 | topk/0.01 |
+|---|---|---|---|---|
+| 1 MiB | 0.048 | 0.076 (1.57×) | 0.098 (2.02×) | **0.157 (3.25×)** |
+| 16 MiB | 0.054 | 0.108 (**1.99×**) | 0.210 (**3.88×**) | **0.298 (5.51×)** |
+
+Every codec still wins, and now wins by almost exactly its wire reduction: `downcast`
+1.99× against a 2.00× ratio, `int8/256` 3.88× against 3.94×. The scalar build reached
+1.91× and 2.33× at the same point — on a 0.05 GB/s path the scalar `downcast` was
+already free, but scalar int8 was not, and vectorising is what turned its 3.94× of
+saved bytes into 3.88× of saved time.
+
 ## Milestones
 
 - [x] **1. Probe:** pairwise bandwidth/latency measurement + persisted topology map.
@@ -398,7 +570,9 @@ the best-of and the median-of statistic, and loses to every codec on Wi-Fi in bo
       hierarchical plans actually executable.
 - [x] **4. Wire compression.** `downcast` and `int8Blockwise` round-trip within their
       error bounds; `topK` carries per-stream error-feedback residuals and converges on
-      the uncompressed result over repeated calls.
+      the uncompressed result over repeated calls. The encoders are vectorised
+      (`CodecKernels`) and byte-compatible with the scalar frames they replace, which
+      is what makes them worth using on a Thunderbolt cable rather than only on Wi-Fi.
 - [~] **5. C shim + MLX adapter; benchmark against MLX's built-in ring.**
       The C shim ships (`mccl.h`, `libmccl.dylib`, validated by a compiled C client) and
       `mcclbench` compares every algorithm against every codec across message sizes,
@@ -420,8 +594,15 @@ the best-of and the median-of statistic, and loses to every codec on Wi-Fi in bo
 - **Non-blocking C calls.** The shim runs every collective to completion. A genuine
   `mcclStream_t` execution context, with `mcclGroupStart`/`mcclGroupEnd` batching,
   waits on there being a device queue worth enqueueing onto.
-- **Vectorised reduction and codec kernels.** `Kernels` and the codecs are scalar
-  loops. This is no longer a theoretical cost: §Measured shows each codec's encode/
-  decode ceiling (~0.50 GB/s for `downcast`, ~0.16 for `int8/256`) sitting *below*
-  what a Thunderbolt cable delivers uncompressed, which is the whole reason the
-  codecs lose there. Vectorising them is the change that would flip that verdict.
+- **Vectorised reduction kernels.** The *codecs* are vectorised (`CodecKernels`, see
+  §Measured: vectorised codecs — `downcast` 8.7–12×, `int8/256` 8–10×, `topk` 1.9×,
+  and the Thunderbolt verdict flipped for the first two). `Kernels.reduce` and
+  `Kernels.scale` are still scalar loops. They are not the bottleneck the codecs were
+  — reduction runs once per received chunk against the codec's twice per call, and it
+  is already the cheapest term in `none`'s 30+ GB/s round trip — but the same runtime
+  stride and per-element dtype switch are in them, and the same fix applies.
+- **Codec choice is still a caller's flag.** Now that two codecs win on Thunderbolt
+  and one loses, `compression:` is a decision the planner has the data to make and
+  the caller usually does not. The pieces exist: the probe measures the fabric, and
+  `mcclbench --codec-bench` measures this machine's ceilings through the same
+  `CodecKernelProbe` the collective runs.

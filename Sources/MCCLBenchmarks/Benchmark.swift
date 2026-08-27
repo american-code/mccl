@@ -129,6 +129,10 @@ public struct BenchOptions: Sendable {
     /// meaningful without letting 64 MiB points dominate the wall clock.
     public var byteBudget = 128 << 20
     public var csv = false
+    /// `--codec-bench`: measure the codec kernels on this machine instead of
+    /// running a collective. The fabric half of the compression rule comes from
+    /// the sweep; this is the machine half.
+    public var codecBench = false
     /// Set by `--sizes`, and then the only sizes swept. Nil means the
     /// `minBytes`/`maxBytes`/`sizeStep` geometric sweep.
     public var explicitSizes: [Int]?
