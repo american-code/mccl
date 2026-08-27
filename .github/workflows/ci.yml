@@ -1,0 +1,76 @@
+name: CI
+
+# What this can and cannot check.
+#
+# A GitHub runner is one machine with no Thunderbolt cable and no second node,
+# so it cannot test the thing mccl exists to do. What it *can* test is
+# everything below the fabric: the codecs, the reduction kernels, the planner,
+# the C ABI, and the collectives over real loopback TCP — one ephemeral port and
+# one socket pair per rank, which is the same code path a cluster takes. The
+# cross-machine numbers come from the lab and are recorded in
+# docs/ARCHITECTURE.md; nothing here pretends to reproduce them.
+#
+# The MLX adapter's tests skip themselves when `mlx.metallib` is absent, which
+# it is here: mlx-swift compiles the MLX C++ core under SwiftPM but does not
+# build the Metal shader library, and MLX's failure to find one aborts the
+# process rather than throwing. The skip is checked below rather than assumed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: swift build + test (macos arm64)
+    runs-on: macos-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the toolchain
+        run: |
+          swift --version
+          uname -m
+          sw_vers
+
+      # mlx-swift is the package's only dependency and by far the slowest part
+      # of a cold build.
+      - name: Cache SwiftPM build products
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build
+        run: swift build -v 2>&1 | tail -40
+
+      - name: Test
+        run: swift test 2>&1 | tee test-output.txt
+
+      # The MLX tests are allowed to skip, but only for the one reason. A skip
+      # that started happening for some other reason — or a suite that silently
+      # stopped containing any tests — would otherwise look like a pass.
+      - name: Check the MLX tests skipped for the reason they are meant to
+        if: always()
+        run: |
+          if grep -q "mlx.metallib is not installed" test-output.txt; then
+            echo "MLX tests skipped as expected (no Metal shader library on the runner)."
+          else
+            echo "::warning::MLX tests did not report the expected metallib skip."
+            grep -i "skip" test-output.txt || echo "no skips reported at all"
+          fi
+
+      - name: Summarise
+        if: always()
+        run: |
+          grep -E "Executed [0-9]+ tests" test-output.txt | tail -2 >> "$GITHUB_STEP_SUMMARY" || true
