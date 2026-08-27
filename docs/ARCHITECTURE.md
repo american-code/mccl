@@ -493,7 +493,10 @@ stayed at zero.
 
 Bus bandwidth, GB/s, best of five sweeps; with n = 2 the bus factor `2(n-1)/n` is 1, so
 these are also the algorithmic figures. Parenthesised is the fraction of the
-probe-measured 1.06 GB/s link.
+1.06 GB/s the probe read on this cable in this session. Per-pair path probing reads the
+same cable at 1.46 GB/s (§Measured: mixed fabric, n = 3), by dialing a route the
+single-address probe did not; the fractions here are against the probe these numbers
+were produced alongside, which is the only denominator they were ever measured against.
 
 | size | none | downcast | int8/256 | topk/0.01 |
 |---|---|---|---|---|
@@ -504,7 +507,7 @@ probe-measured 1.06 GB/s link.
 | 16 MiB | **0.746 (70.4%)** | 0.505 (47.6%) | 0.190 (17.9%) | 0.271 (25.6%) |
 | 64 MiB | **0.616 (58.1%)** | 0.462 (43.6%) | 0.161 (15.2%) | 0.274 (25.8%) |
 
-**Uncompressed all-reduce reaches 70.4% of the probed link at 16 MiB.** The probe
+**Uncompressed all-reduce reaches 70.4% of this session's probed link at 16 MiB.** The probe
 measures a one-directional stream; an all-reduce additionally reduces every byte it
 receives and turns the link around twice, so losing 30% to that is a good result and
 says the framing and the ring schedule are not where the time goes. It falls back to
@@ -1085,8 +1088,10 @@ the absence of the optimiser rather than the kernel.
 
 - **A same-language head-to-head against MLX's built-in ring.** Blocked upstream, not
   here: mlx-swift ships no distributed support. Python MLX does, so a cross-language
-  measurement over the same cable is possible and is recorded in COMPARISON.md, but it
-  compares two runtimes rather than two schedulers.
+  measurement over the same cable is possible, but it compares two runtimes rather than
+  two schedulers, and it has not been run — MLX's launcher wants passwordless ssh
+  between the nodes, which these two do not have. COMPARISON.md §The comparison that
+  cannot be run has the details.
 - ~~**A 3+ node run.**~~ Done — §Measured: n = 3 (uniform Wi-Fi, ring against tree) and
   §Measured: mixed fabric, n = 3 (a Thunderbolt island plus a Wi-Fi bridge rank, all
   three algorithms, with the paths each pair chose recorded next to the numbers).

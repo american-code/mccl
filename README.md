@@ -57,7 +57,10 @@ lives in its own test target so that `MCCL`'s tests never acquire an MLX
 dependency), run in CI on macOS arm64 on every push. First real-hardware
 validation: two Mac Studio M1 Max machines on a
 direct Thunderbolt cable negotiated at 20 Gb/s probed at **1.06 GB/s and 167.8 µs**,
-with the Thunderbolt and Wi-Fi paths correctly classified from interface media.
+with the Thunderbolt and Wi-Fi paths correctly classified from interface media. The
+same cable later read **1.46 GB/s** under per-pair path probing, which dials a route
+the single-address probe did not; both are real paths between the same two machines,
+so the IP-over-TB stack tax is a 42–58% range rather than a point.
 
 **Data-parallel training works, and is provably the same computation as training
 on one machine.** `MCCLMLX` lets an MLX program hand mccl an `MLXArray`;
@@ -113,7 +116,7 @@ measurement says *the executor exploits full duplex*, not that topology selectio
 Collective throughput is measured on that cable rather than only over loopback.
 `mcclbench` runs distributed (`--rank` / `--world-size`, joining through a rendezvous
 token), and a 2-node all-reduce reaches **0.746 GB/s bus bandwidth at 16 MiB — 70.4%
-of the probed link**.
+of the 1.06 GB/s that same session's probe read on the cable**.
 
 **The result that generalises is a rule, and it survived being tested from both
 sides.** *A codec pays only when the fabric's uncompressed all-reduce rate is below
@@ -193,16 +196,22 @@ for the tables, the method, and the ceilings measured per chip.
   excludes `mlx/distributed/{ring,mpi,nccl,jaccl}`) and exposes no distributed
   API. Python MLX does ship the ring, so a cross-language measurement over the
   same cable is possible — it compares two runtimes rather than two schedulers.
-- **The hierarchical plan on real hardware**, which needs four machines with two
-  fast islands. n = 3 validated ring-versus-tree selection; nothing has yet exercised
-  island detection, and nothing has tested the planner on a mixed-speed fabric.
+- **Two islands of two, on real hardware.** The mixed fabric above exercised island
+  detection and the hierarchical plan in their smallest form — one island of two plus
+  one bridge rank. The two-island shape the plan was originally written for needs a
+  fourth machine, and the lab has three; it is tested in the suite only.
 - **A crossover constant that matches measurement.** The closed form has the right
-  shape and is 4–13× low on Wi-Fi, because it assumes one bandwidth.
+  shape and is 4–13× low on uniform Wi-Fi, because it assumes one bandwidth. It lands
+  correctly on the mixed fabric, where the bottleneck really is one constant.
 - Thunderbolt-specific transport (bulk DMA rather than IP-over-TB).
 - A rendezvous *service*. `Rendezvous` closes the gap the C ABI needs — one round
   trip through rank 0 — but there is no discovery, no membership change, and no
   recovery from a rank restarting.
-- Non-blocking C calls.
+- **Non-blocking calls beyond all-reduce.** `mcclAllReduceAsync`, `mcclRequestWait`
+  and `mcclRequestTest` ship; all-gather, broadcast, reduce and reduce-scatter are
+  blocking-only, and there is no `mcclGroupStart`/`mcclGroupEnd` batching.
+- **Compression as a planned decision rather than a caller's flag.** The rule that
+  decides it is measured; nothing in the API expresses it yet.
 
 Each of these has a seam already cut for it; [USAGE.md's "Implementing what is
 missing"](docs/USAGE.md#implementing-what-is-missing) is enough to start any of

@@ -1499,7 +1499,7 @@ metallib inside is a compiled Apple GPU shader library, so the wheel's Python ta
 is irrelevant to it.
 
 **Tests skip rather than crash.** Every test in `MCCLMLXTests` checks for the
-library before touching MLX and skips with the fix if it is missing. The 239
+library before touching MLX and skips with the fix if it is missing. The 275
 tests of the core library never load MLX at all, so a machine without the
 metallib still runs them.
 
@@ -1906,8 +1906,10 @@ The comparison that *is* reachable is cross-language: Python MLX ships the ring
 backend and `python3 -m mlx.distributed_run --backend ring` will drive it over the
 same Thunderbolt pair. It compares two different language runtimes rather than two
 schedulers, so read it as a sanity check on the fabric rather than as a verdict on
-either implementation; the numbers such as they are live in
-[COMPARISON.md](COMPARISON.md).
+either implementation. It has not been run: MLX's launcher wants passwordless ssh
+*between* the nodes, and these two trust only the driving workstation, which is a
+change to the lab machines rather than a measurement. [COMPARISON.md](COMPARISON.md)
+§The comparison that cannot be run records the state of it.
 
 A genuine head-to-head would need mlx-swift to expose `mlx::distributed`, or a
 build of mlx-swift with those sources put back in.

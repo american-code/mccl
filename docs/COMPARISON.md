@@ -1,7 +1,8 @@
 # mccl vs. NCCL: a measured comparison
 
-*2026-08-26. Local numbers measured with mcclbench/mcclprobe on two Mac Studio M1 Max
-machines joined by a direct Thunderbolt cable (negotiated 20 Gb/s); CUDA numbers cited.
+*2026-08-27. Local numbers measured with mcclbench/mcclprobe on two Mac Studio M1 Max
+machines joined by a direct Thunderbolt cable (negotiated 20 Gb/s), plus an M1 Pro laptop
+reachable from either only over Wi-Fi for the n = 3 runs; CUDA numbers cited.
 Absolute cross-platform numbers are meaningless — the comparison is efficiency
 fractions: what share of the respective interconnect's ceiling each stack extracts.*
 
@@ -19,8 +20,11 @@ Sources: [nccl-tests #149](https://github.com/NVIDIA/nccl-tests/issues/149),
 
 ## mccl measured (2-node Thunderbolt, fp32 sum all-reduce, ring, best of 5, scalar codecs)
 
-Probe-measured achievable link: 1.06 GB/s (42% of the 20 Gb/s line — the IP-over-TB
-stack tax, paid before mccl runs).
+Probe-measured achievable link **for this run**: 1.06 GB/s (42% of the 20 Gb/s line —
+the IP-over-TB stack tax, paid before mccl runs). Per-pair path probing later read the
+same cable at 1.46 GB/s (58% of the line) in the mixed-fabric world; the fractions in
+the table below are against the probe taken alongside the sweep, which is the only
+denominator its own numbers were produced against.
 
 | size | busbw | of measured link | of raw line rate |
 |---|---|---|---|
@@ -29,10 +33,11 @@ stack tax, paid before mccl runs).
 | 16 MiB | **0.746 GB/s** | **70.4%** | 30% |
 | 64 MiB | 0.616 GB/s | 58.1% | 25% |
 
-Two denominators, both honest. Against the raw line, mccl's 25–30% sits at the low edge
-of NCCL-over-TCP's 32–48%; the difference is the IP-over-TB tax that the probe itself
+Two denominators, both honest. Against the raw line, mccl's 25–30% sits below
+NCCL-over-TCP's 32–48%; the difference is the IP-over-TB tax that the probe itself
 pays, which a bulk-DMA transport would attack. Against what the link demonstrably
-carries — the fraction mccl's own scheduling controls — the collective extracts 70%.
+carried in the same session — the fraction mccl's own scheduling controls — the
+collective extracts 70%.
 
 ## The compression comparison NCCL cannot enter
 
@@ -116,11 +121,36 @@ model assumes a single bandwidth `B`, and Wi-Fi's effective bandwidth moves twen
 across this sweep (0.001 → 0.021 GB/s bus). Right shape, wrong constant: the planner
 picks correctly on either side of a crossover it locates in the wrong place.
 
-Still untested: the hierarchical plan, which needs at least two islands of two ranks and
-so n ≥ 4, and the mixed-speed fabric island detection exists for.
+## Island detection, on a fabric that has islands
 
-Full tables and method notes: [ARCHITECTURE.md](ARCHITECTURE.md) §Measured,
-[WHITEPAPER.md](WHITEPAPER.md) §6; the value thesis this comparison feeds is
+The mixed-speed fabric island detection exists for is the third measured case: the same
+three machines, but with the two Studios on a Thunderbolt cable and the laptop reachable
+from either only over Wi-Fi. A 20.76× ratio inside one world, and the probe splits it
+`[0,1] [2]` from its own measurements with nothing told to the planner.
+
+| size | ring | tree | hierarchical | best |
+|---|---|---|---|---|
+| 256 KiB | 31.0 / 27.9 ms | 27.8 / 31.7 ms | **24.8 / 21.5 ms** | hierarchical |
+| 1 MiB | 64.1 / 61.9 ms | 84.2 / 50.9 ms | **49.7 / 44.9 ms** | hierarchical |
+| 4 MiB | 185.1 / 219.5 ms | 135.8 / 156.5 ms | **117.4 / 118.2 ms** | hierarchical |
+| 16 MiB | 803.3 / 763.6 ms | 492.7 / 490.0 ms | **465.4 / 433.6 ms** | hierarchical |
+
+Two independent runs; the hierarchical plan wins in both at every size from 256 KiB to
+16 MiB, by **1.74× over the ring** at 16 MiB. Below 256 KiB the run-to-run spread equals
+the between-algorithm spread and the rows measure Wi-Fi jitter rather than a plan. At
+64 MiB, one run, the tree takes it back by 8%. NCCL has no comparable published result to
+score against here, because NCCL's fabric is homogeneous and enumerable by construction;
+the point of the row is that the planner reached the split without being told it.
+
+The closed form also lands correctly on this fabric — 139.9 KiB predicted, 64–256 KiB
+measured — where it was 4–13× low on uniform Wi-Fi. The difference is in the fabric: a
+mixed fabric's bottleneck bandwidth really is one constant.
+
+Still untested on hardware: two islands of two ranks, which needs n ≥ 4 and a fourth
+machine the lab does not have, and anything at all about scale beyond n = 3.
+
+Full tables and method notes: [ARCHITECTURE.md](ARCHITECTURE.md) §Measured: mixed
+fabric, n = 3, [WHITEPAPER.md](WHITEPAPER.md) §6; the value thesis this comparison feeds is
 [WHITEPAPER.md §3](WHITEPAPER.md#3-value-proposition-competing-with-the-cuda-cluster-stack).
 
 

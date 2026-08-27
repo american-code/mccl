@@ -195,7 +195,8 @@ at 16,384 (§6.1e).
 
 **Where the CUDA stack remains ahead.** Three places, and they are not small.
 *Fabric:* mccl is TCP/IP only. Thunderbolt is reached as IP over the TB bridge and
-gives up roughly 58% of line rate to the stack before mccl runs, so against the
+gives up 42–58% of line rate to the stack before mccl runs — the two probes of the
+same cable in §6.1 bracket it — so against the
 raw line mccl's 25–30% sits below NCCL-over-TCP's published 32–48%, and an
 RDMA-class fabric is out of reach entirely until the bulk-DMA transport of §7
 exists. *Scale:* the planner is validated at n = 3 on both a uniform and a mixed
@@ -482,7 +483,7 @@ with `mcclprobe measure`.
 | direct Thunderbolt cable | 1.06 GB/s | 167.8 µs | `usb4` |
 | Wi-Fi | 101 MB/s | 2.62 ms | `wifi` |
 
-Three things this establishes, and one it does not.
+Four things this establishes, and one it does not.
 
 **The probe produces sane numbers on a real link.** 1.06 GB/s against a 20 Gb/s
 (2.5 GB/s) negotiated line rate is 42.4%, squarely inside the 32–48% commonly
@@ -490,8 +491,19 @@ reported for NCCL over TCP sockets — the right comparison, since mccl reaches
 Thunderbolt as IP over the TB bridge and pays the same stack costs. That is
 evidence the methodology is sound and the framing layer has no gross
 inefficiency, and simultaneously the strongest available argument for the
-bulk-DMA transport of §7: roughly 58% of the link is lost to a protocol stack a
-direct transport would not traverse.
+bulk-DMA transport of §7: roughly 58% of the link is lost here to a protocol stack
+a direct transport would not traverse.
+
+**The same cable reads 1.46 GB/s under per-pair path probing** (§6.1f, 213.7 µs),
+which is 58.4% of the same line rate. The two probes differ in which address each
+end dials — the mixed-fabric world has every rank advertise all of its addresses
+and every pair select and dial its own path (§4.5), and on a machine with three
+Thunderbolt ports sharing one `169.254/16` that is not the same route the
+single-address probe took. Both readings are of a real path between the same two
+machines, so the honest statement of the stack tax is a range and not a point, and
+every fraction below is against the probe taken alongside its own sweep. Which
+route a `169.254/16` address reaches is not something the probe reports today; §7
+records it as the measurement that would collapse the range to a number.
 
 **Interface-based link classification works.** The two paths between the same
 pair of machines were attributed to their respective interfaces and labelled
@@ -518,7 +530,9 @@ same `Rendezvous` token the C shim uses — so the same sweep that ran over
 loopback runs over the cable of §6.1. Rank 0 on `studio-a` bound to
 `169.254.152.222`, rank 1 on `studio-b` bound to `169.254.23.203`, all-reduce fp32
 sum, ring, best of five sweeps. Bus bandwidth in GB/s; with n = 2 the bus factor
-is 1, and the parenthesised figure is the fraction of the 1.06 GB/s probed link.
+is 1, and the parenthesised figure is the fraction of the 1.06 GB/s §6.1 read on
+this cable alongside this sweep — not of the 1.46 GB/s §6.1f's per-pair probe reads
+on it, which is a different route and a different session.
 
 | size | none | downcast | int8/256 | topk/0.01 |
 |---|---|---|---|---|
@@ -529,7 +543,7 @@ is 1, and the parenthesised figure is the fraction of the 1.06 GB/s probed link.
 | 16 MiB | **0.746 (70.4%)** | 0.505 (47.6%) | 0.190 (17.9%) | 0.271 (25.6%) |
 | 64 MiB | **0.616 (58.1%)** | 0.462 (43.6%) | 0.161 (15.2%) | 0.274 (25.8%) |
 
-Uncompressed all-reduce reaches 70.4% of the probed link at 16 MiB. The probe
+Uncompressed all-reduce reaches 70.4% of that session's probed link at 16 MiB. The probe
 measures a one-directional stream; an all-reduce reduces every byte it receives
 and turns the link around twice, so 70% is evidence that neither the framing nor
 the ring schedule is where the time goes.
@@ -593,9 +607,10 @@ is close to definitional once both schedules are written out. Its value is as a
 correction to the naive expectation of a tie, nothing more. The plans that
 motivate having a planner at all — the tree's `O(log n)` dependent hops, the
 hierarchical plan's single crossing of a slow bridge — cannot pay at n = 2 and
-only begin to at n ≥ 4. **§4.2's planner is therefore unvalidated on hardware,
-and stays that way until a 3+ node run.** That, not another 2-node sweep, is the
-experiment that would test it.
+only begin to at n ≥ 4. **§4.2's planner is therefore unvalidated by this run, and
+stays that way until a 3+ node one.** That, not another 2-node sweep, is the
+experiment that would test it — and §6.1d and §6.1f are that experiment, on a
+uniform and then a mixed fabric.
 
 *Method.* `studio-a` was shared with an unrelated workload throughout, and
 worst-case points reached 5× the best within a sweep, so every figure is the best
@@ -758,10 +773,11 @@ twentyfold range. §4.1's stronger framing — that solving beats tuning — sur
 as *which* algorithm to pick and fails as far as *where* to switch; a size-dependent
 bandwidth model is the obvious repair and is not attempted here.
 
-**What remains untested** is the hierarchical plan, which needs at least two islands of
-two ranks. A uniform three-rank fabric has none, and the sweep correctly produced no
-hierarchical rows for it — though it did so silently, which was a reporting bug and is
-now a printed line (`BenchAlgorithm.inapplicabilityReason(worldSize:)`).
+**What this run leaves untested** is the hierarchical plan. A uniform three-rank fabric
+has no islands, and the sweep correctly produced no hierarchical rows for it — though it
+did so silently, which was a reporting bug and is now a printed line
+(`BenchAlgorithm.inapplicabilityReason(worldSize:)`). §6.1f puts the same three machines
+on a fabric that does have islands and measures it there.
 
 ### 6.1e An MLX adapter, and data-parallel training that is honestly slower
 
@@ -1033,14 +1049,16 @@ library did not generate synthetically.
 ## 7. Limitations and future work
 
 **Evaluation reaches three machines, not four.** §6.1d gives the planner its first
-real test and it passes qualitatively — tree below the crossover, ring above — but
-two gaps remain. The closed-form threshold is 4–13× low on a fabric whose
+real test and it passes qualitatively — tree below the crossover, ring above — and
+§6.1f gives island detection and the hierarchical plan theirs on a mixed fabric.
+Two gaps remain. The closed-form threshold is 4–13× low on a fabric whose
 bandwidth varies with message size, so §4.1's "solved, not tuned" holds for
-*which* algorithm and not for *where* to switch. And the hierarchical plan is
-still untested: it needs at least two islands of two ranks, which means four
-machines on a mixed Thunderbolt/Ethernet fabric. That remains the experiment that
-would validate §4.2, and `mcclbench` in distributed mode is the harness ready to
-run it.
+*which* algorithm and not for *where* to switch there; on the mixed fabric, whose
+bottleneck is one constant, it lands correctly. And the hierarchical plan has been
+run only in its smallest form — one island of two plus one bridge rank. Two islands
+of two needs a fourth machine on a mixed Thunderbolt/Ethernet fabric; that is the
+experiment §4.2 still wants, and `mcclbench` in distributed mode is the harness
+ready to run it.
 
 **No same-language head-to-head against MLX's ring, and the obstacle is upstream.**
 The comparison that would establish whether mccl is worth using — mccl against
@@ -1056,16 +1074,27 @@ needs mlx-swift to expose `mlx::distributed`, or a build of it with those source
 restored.
 
 **No Thunderbolt-specific transport.** Thunderbolt is reached as ordinary IP over
-the TB bridge, and the 42.4% of line rate in §6.1 is the direct cost. A bulk-DMA
-transport implementing `listen`/`connect` would leave everything above it
-unchanged, and is the largest identified performance opportunity in the system.
+the TB bridge, and the 42–58% of line rate the probe does not reach in §6.1 is the
+direct cost. A bulk-DMA transport implementing `listen`/`connect` would leave
+everything above it unchanged, and is the largest identified performance
+opportunity in the system.
+
+**The probe does not report which route a link-local address reached.** §6.1 and
+§6.1f read the same cable at 1.06 and 1.46 GB/s, and the difference is which of a
+machine's three Thunderbolt ports — all sharing one `169.254/16` — the dialing end
+happened to select. `mcclprobe` reports the pair and the media, not the egress
+interface it resolved to, so the stack tax stays a range. Printing the resolved
+interface per path is a small change to `Probe` and is what would collapse it to a
+number.
 
 **The rendezvous is not a service.** One round trip through rank 0 — no
 discovery, no membership change, no recovery from a rank restarting. Discovery
 (mDNS, with interface enumeration already in place) and a durable coordinator are
 additive; membership change and reconnection would reach into the collectives.
 
-**The C calls all block.** A genuine `mcclStream_t` execution context with
+**Asynchrony stops at all-reduce.** `mcclAllReduceAsync`, `mcclRequestWait` and
+`mcclRequestTest` ship (§5); all-gather, broadcast, reduce and reduce-scatter are
+blocking-only. A genuine `mcclStream_t` execution context with
 `mcclGroupStart`/`mcclGroupEnd` batching waits on there being a device queue
 worth enqueueing onto. (The reduction kernels are no longer a limitation: §6.1c
 applies the same fix the codecs got, for the same reason, at 4.4–5.1× on fp32.)
@@ -1105,7 +1134,8 @@ harness, an MLX adapter and a data-parallel training demo — 309 tests at 89.98
 region coverage, run in CI on every push, and no external dependencies outside
 the MLX target. The
 first real-hardware measurement puts a direct Thunderbolt link at 1.06 GB/s and
-167.8 µs, 42.4% of its negotiated line rate, with both paths between the machines
+167.8 µs, 42.4% of its negotiated line rate — 1.46 GB/s and 58.4% under the
+per-pair probing a mixed fabric needs — with both paths between the machines
 correctly classified. On that link the compression rule of §6.1a has now been
 tested rather than merely stated: vectorising the encoders lifted two codecs'
 ceilings above the fabric's rate and both flipped from losing to winning, while
