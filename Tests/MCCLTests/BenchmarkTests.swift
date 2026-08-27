@@ -148,7 +148,14 @@ final class BenchmarkTests: XCTestCase {
             return XCTFail("hierarchical plan missing")
         }
         XCTAssertEqual(islands, [[0, 1], [2, 3]])
-        XCTAssertNil(BenchAlgorithm.hierarchical.plan(worldSize: 3))
+
+        // Three ranks split into a fast pair and one bridge rank, which is what
+        // two machines on a cable plus a laptop is. Two ranks split into two
+        // singletons, which is the ring with extra words.
+        guard case .hierarchical(let small, _)? = BenchAlgorithm.hierarchical.plan(worldSize: 3) else {
+            return XCTFail("a 2+1 fabric has a hierarchical plan")
+        }
+        XCTAssertEqual(small, [[0, 1], [2]])
         XCTAssertNil(BenchAlgorithm.hierarchical.plan(worldSize: 2))
     }
 
@@ -288,15 +295,14 @@ final class BenchmarkTests: XCTestCase {
     // MARK: - Inapplicable algorithms
 
     /// A world with no hierarchy produces no hierarchical rows, and that has to
-    /// be *said*. An n=3 sweep asked for `hierarchical` and silently got a table
-    /// without it, which reads as a broken harness rather than as a property of
-    /// a uniform three-rank fabric.
+    /// be *said*. A sweep that silently drops the algorithm it was asked for
+    /// reads as a broken harness rather than as a property of the world.
     func testHierarchicalReportsWhyItIsInapplicable() {
-        for worldSize in [1, 2, 3] {
+        for worldSize in [1, 2] {
             XCTAssertNil(BenchAlgorithm.hierarchical.plan(worldSize: worldSize))
             let reason = BenchAlgorithm.hierarchical.inapplicabilityReason(worldSize: worldSize)
             XCTAssertNotNil(reason, "world of \(worldSize)")
-            XCTAssertTrue(reason?.contains("islands") ?? false, reason ?? "nil")
+            XCTAssertTrue(reason?.contains("singleton") ?? false, reason ?? "nil")
             XCTAssertTrue(reason?.contains("\(worldSize)") ?? false, reason ?? "nil")
         }
     }
@@ -306,6 +312,8 @@ final class BenchmarkTests: XCTestCase {
             XCTAssertNil(BenchAlgorithm.ring.inapplicabilityReason(worldSize: worldSize))
             XCTAssertNil(BenchAlgorithm.tree.inapplicabilityReason(worldSize: worldSize))
         }
+        XCTAssertNil(BenchAlgorithm.hierarchical.inapplicabilityReason(worldSize: 3),
+                     "a fast pair plus a bridge rank is a hierarchy")
         XCTAssertNil(BenchAlgorithm.hierarchical.inapplicabilityReason(worldSize: 4))
     }
 

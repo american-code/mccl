@@ -178,4 +178,23 @@ enum Fabrics {
         ]
         return Topology(nodes: nodes, links: links)
     }
+
+    /// The lab's mixed fabric, to scale: two Mac Studios on a Thunderbolt cable
+    /// plus a laptop that can only reach either of them over Wi-Fi. One island
+    /// of two and one singleton — the smallest topology that is genuinely mixed,
+    /// and the one a two-machine lab plus a laptop actually produces.
+    ///
+    /// The bandwidths are the measured ones from
+    /// docs/ARCHITECTURE.md §Measured: mixed fabric.
+    static func islandPlusBridge() -> Topology {
+        let nodes = (0..<3).map {
+            Topology.Node(id: $0, hostname: "node\($0)", chip: "M1 Max", unifiedMemoryBytes: 64 << 30)
+        }
+        let links = [
+            Topology.Link(from: 0, to: 1, kind: .thunderbolt4, measuredBandwidth: 1.06e9, measuredLatency: 90e-6),
+            Topology.Link(from: 0, to: 2, kind: .wifi, measuredBandwidth: 6.1e7, measuredLatency: 1.9e-3),
+            Topology.Link(from: 1, to: 2, kind: .wifi, measuredBandwidth: 5.8e7, measuredLatency: 2.1e-3),
+        ]
+        return Topology(nodes: nodes, links: links)
+    }
 }

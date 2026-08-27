@@ -87,6 +87,102 @@ final class PlannerTests: XCTestCase {
         }
     }
 
+    // MARK: - one island and a bridge rank
+
+    /// The textbook mixed case, and the smallest one a real lab produces: two
+    /// machines on a fast cable plus a third that can only be reached slowly.
+    ///
+    /// It is worth being explicit that this *is* covered, because the obvious
+    /// reading of "hierarchical needs two islands of two ranks" says it is not.
+    /// What island detection actually requires is at least two groups, fewer
+    /// groups than ranks, and at least one group with more than one member. A
+    /// singleton island satisfies all three: it is an island whose intra-island
+    /// reduction is a no-op, and its leader is itself.
+    func testOneFastIslandPlusABridgeRankPlansHierarchically() {
+        let topo = Fabrics.islandPlusBridge()
+        let analysis = TopologyPlanner.analyze(topo)
+        XCTAssertEqual(analysis.islands ?? [], [[0, 1], [2]])
+        XCTAssertGreaterThan(analysis.heterogeneityRatio ?? 0, 3.0)
+
+        guard case .hierarchical(let islands, let root) =
+                TopologyPlanner.plan(for: topo, messageBytes: 16 << 20) else {
+            return XCTFail("expected a hierarchical plan for a 2+1 fabric")
+        }
+        XCTAssertEqual(islands, [[0, 1], [2]])
+        XCTAssertTrue([0, 2].contains(root), "the inter-island root must be an island leader")
+    }
+
+    /// The plan is only worth having if the collective can execute it. With a
+    /// singleton island, step 1 (reduce inside the island) and step 3 (push the
+    /// result back down) are both no-ops for rank 2, and step 2 carries it.
+    func testAHierarchicalPlanWithASingletonIslandAllReducesCorrectly() async throws {
+        let topo = Fabrics.islandPlusBridge()
+        let comms = try Communicator.tcpGroup(worldSize: 3, topology: topo)
+        defer { comms.forEach { $0.shutdown() } }
+        for comm in comms {
+            comm.planOverride = .hierarchical(islands: [[0, 1], [2]], interIslandRoot: 0)
+        }
+
+        let count = 4096
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for comm in comms {
+                group.addTask {
+                    let buffer = UnsafeMutableRawBufferPointer.allocate(
+                        byteCount: count * 4, alignment: 64)
+                    defer { buffer.deallocate() }
+                    let floats = buffer.bindMemory(to: Float.self)
+                    for i in 0..<count { floats[i] = Float((comm.rank + 1) * (i % 7 + 1)) }
+                    try await comm.allReduce(buffer, count: count, dataType: .float32, op: .sum)
+                    for i in 0..<count {
+                        XCTAssertEqual(floats[i], Float(6 * (i % 7 + 1)), accuracy: 1e-3, "element \(i)")
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
+    func testASingletonIslandBroadcastsFromEitherSideOfTheBridge() async throws {
+        let topo = Fabrics.islandPlusBridge()
+        for root in 0..<3 {
+            let comms = try Communicator.tcpGroup(worldSize: 3, topology: topo)
+            defer { comms.forEach { $0.shutdown() } }
+            for comm in comms {
+                comm.planOverride = .hierarchical(islands: [[0, 1], [2]], interIslandRoot: 0)
+            }
+            let count = 256
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for comm in comms {
+                    group.addTask {
+                        let buffer = UnsafeMutableRawBufferPointer.allocate(
+                            byteCount: count * 4, alignment: 64)
+                        defer { buffer.deallocate() }
+                        let floats = buffer.bindMemory(to: Float.self)
+                        for i in 0..<count { floats[i] = comm.rank == root ? Float(i) : -1 }
+                        try await comm.broadcast(buffer, count: count, dataType: .float32, root: root)
+                        for i in 0..<count {
+                            XCTAssertEqual(floats[i], Float(i), "root \(root), rank \(comm.rank), element \(i)")
+                        }
+                    }
+                }
+                try await group.waitForAll()
+            }
+        }
+    }
+
+    /// Two ranks cannot be mixed however different the one link between them
+    /// is: one link has no gap to find, and splitting them would make two
+    /// singleton islands, which is a ring with extra words.
+    func testTwoRanksAreNeverHierarchical() {
+        let nodes = (0..<2).map {
+            Topology.Node(id: $0, hostname: "n\($0)", chip: "M1 Max", unifiedMemoryBytes: 1)
+        }
+        let topo = Topology(nodes: nodes, links: [
+            Topology.Link(from: 0, to: 1, kind: .wifi, measuredBandwidth: 6e7, measuredLatency: 2e-3),
+        ])
+        XCTAssertNil(TopologyPlanner.analyze(topo).islands)
+    }
+
     func testThreeIslandsAreDetected() {
         let nodes = (0..<6).map {
             Topology.Node(id: $0, hostname: "n\($0)", chip: "M2 Ultra", unifiedMemoryBytes: 192 << 30)

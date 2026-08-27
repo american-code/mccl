@@ -10,7 +10,20 @@ public enum BenchAlgorithm: String, CaseIterable, Sendable {
     case ring, tree, hierarchical
 
     /// The plan to pin on every rank. `nil` when the shape does not exist for
-    /// this world — a hierarchical plan needs at least two islands of two.
+    /// this world.
+    ///
+    /// The hierarchical split takes the low half of the ranks — rounded *up* —
+    /// as the fast island and the rest as the second one. At n = 4 that is the
+    /// two-TB-pairs shape the plan was written for; at n = 3 it is
+    /// `[[0,1],[2]]`, one fast island plus a single bridge rank, which is what
+    /// two machines on a cable plus a laptop actually is.
+    ///
+    /// A singleton island is a real island, not a degenerate one: its
+    /// intra-island reduction is a no-op and its leader is itself, so the plan
+    /// reduces to "sum inside the fast pair, cross the slow link once, push the
+    /// answer back" — exactly the traffic shape the hierarchical plan exists to
+    /// produce. What it cannot do is n = 2, where the split is two singletons
+    /// and nothing is left for the ring to be a ring over.
     public func plan(worldSize: Int) -> CollectivePlan? {
         let order = Array(0..<worldSize)
         switch self {
@@ -19,11 +32,9 @@ public enum BenchAlgorithm: String, CaseIterable, Sendable {
         case .tree:
             return .tree(root: 0, children: TopologyPlanner.binomialTree(order: order, root: 0))
         case .hierarchical:
-            guard worldSize >= 4 else { return nil }
-            // Split down the middle: the shape of two TB-bridged pairs, which is
-            // the fabric the hierarchical plan exists for.
-            let half = worldSize / 2
-            return .hierarchical(islands: [Array(0..<half), Array(half..<worldSize)],
+            guard worldSize >= 3 else { return nil }
+            let fast = (worldSize + 1) / 2
+            return .hierarchical(islands: [Array(0..<fast), Array(fast..<worldSize)],
                                  interIslandRoot: 0)
         }
     }
@@ -34,14 +45,14 @@ public enum BenchAlgorithm: String, CaseIterable, Sendable {
     /// algorithm silently, which reads as a bug in the harness rather than as a
     /// property of the world: an n=3 run asked for `hierarchical` and simply got
     /// a table with no hierarchical rows in it and no explanation. Dropping the
-    /// rows is correct — three ranks on a uniform fabric have no islands — but
-    /// saying so is part of being correct.
+    /// rows is correct where there is nothing to drop into — but saying so is
+    /// part of being correct.
     public func inapplicabilityReason(worldSize: Int) -> String? {
         guard plan(worldSize: worldSize) == nil else { return nil }
         switch self {
         case .hierarchical:
-            return "needs at least two islands of two ranks; a \(worldSize)-rank "
-                + "uniform fabric has none"
+            return "needs an island and something to bridge to; \(worldSize) ranks "
+                + "split into two singletons, which is the ring"
         case .ring, .tree:
             return "no plan for a \(worldSize)-rank world"
         }
