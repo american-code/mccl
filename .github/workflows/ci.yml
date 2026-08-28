@@ -68,20 +68,39 @@ jobs:
       # re-runs the same path, which is cheap and harmless; on a newer one it is
       # the only coverage the no-header path gets.
       - name: Report which RDMA path this runner takes
+        id: rdma-path
         run: |
           SDK=$(xcrun --show-sdk-path)
           echo "SDK: $SDK"
           if [ -f "$SDK/usr/include/infiniband/verbs.h" ]; then
-            echo "verbs.h present — the default build uses the real header"
+            echo "verbs.h present — the default build above used the real header"
+            echo "header=present" >> "$GITHUB_OUTPUT"
           else
-            echo "verbs.h absent — the default build uses the stub path"
+            echo "verbs.h absent — the default build above already used the stub path"
+            echo "header=absent" >> "$GITHUB_OUTPUT"
           fi
           ls -l "$SDK/usr/lib/librdma.tbd" 2>&1 || true
 
-      - name: Test the RDMA stub path (SDK without verbs.h)
+      # Compile the branch this runner's SDK did not take. Only the C shim
+      # differs between the two — the Swift above it is identical, and reads the
+      # same declarations from crdma.h either way — so what can actually break
+      # is a stub signature drifting from the header, which compiling catches.
+      #
+      # Compiling rather than `swift test -Xcc -D...`: the flag changes the build
+      # plan, so a full rerun rebuilds mlx-swift from scratch and roughly doubles
+      # the job for coverage the compile already gives. `swift test -Xcc
+      # -DMCCL_RDMA_FORCE_STUB` is the local command for the full check, and
+      # docs/RDMA.md says so.
+      - name: Compile the RDMA shim on both paths
         run: |
-          set -o pipefail
-          swift test -Xcc -DMCCL_RDMA_FORCE_STUB 2>&1 | tail -20
+          set -euo pipefail
+          echo "--- with whatever this SDK has ---"
+          xcrun clang -c Sources/CRDMA/shim.c -ISources/CRDMA -o /tmp/shim-default.o
+          echo "ok"
+          echo "--- forced stub path (SDK without verbs.h) ---"
+          xcrun clang -c -DMCCL_RDMA_FORCE_STUB Sources/CRDMA/shim.c -ISources/CRDMA \
+            -o /tmp/shim-stub.o
+          echo "ok"
 
       # The MLX tests are allowed to skip, but only for the one reason. A skip
       # that started happening for some other reason — or a suite that silently

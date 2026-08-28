@@ -262,7 +262,10 @@ Being precise about this matters more than the feature.
   stub — and the whole suite passes on that path, exercised on a machine that
   *does* have the header via `swift test -Xcc -DMCCL_RDMA_FORCE_STUB`. Without
   that flag the no-header branch would only ever run on CI, where nobody watches
-  it; CI now builds both paths explicitly for the same reason.
+  it. CI compiles both branches of the shim on every push; the full
+  `swift test -Xcc -DMCCL_RDMA_FORCE_STUB` is the local command, because the
+  flag changes SwiftPM's build plan and a rerun on CI would rebuild mlx-swift
+  from scratch for coverage the compile already provides.
 - The built binaries contain **zero** load-time references to librdma.
 
 **Verified at runtime, on an M1 with no Thunderbolt 5:**
