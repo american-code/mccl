@@ -39,8 +39,8 @@ MLX adapter and a data-parallel
 training demo whose two-rank loss trajectory reproduces a single-process run on
 the combined batch to 4.8e-07 in one process and 3.6e-05 across two machines —
 and which is, at small batch, honestly slower than one machine, with the
-crossover measured rather than assumed. Correctness is evaluated by 309 tests at
-89.98% region coverage, run in CI on every push, including byte-level
+crossover measured rather than assumed. Correctness is evaluated by 379 tests at
+87.06% region coverage, run in CI on every push, including byte-level
 interoperation between the vectorised and scalar encoders.
 
 ---
@@ -1040,7 +1040,7 @@ than test; and anything at all about sixteen nodes.
 
 ### 6.2 Correctness
 
-The test suite is 309 tests across 23 suites, all passing, run with
+The test suite is 379 tests across 30 suites, all passing, run with
 `swift test`. They are split across two test targets: 275 tests exercise the core
 library, which has no dependencies, and 34 exercise the MLX adapter. The split is
 deliberate — `MCCL`'s tests must keep running on a machine that has never fetched
@@ -1093,13 +1093,25 @@ Coverage, regenerated with `swift test --enable-code-coverage` and `llvm-cov`:
 
 | metric | covered |
 |---|---|
-| region | **89.98%** (286 of 2854 regions missed) |
-| function | **92.59%** (61 of 823 missed) |
-| line | **96.10%** (227 of 5817 missed) |
+| region | **87.06%** (420 of 3245 regions missed) |
+| function | **88.50%** (113 of 983 missed) |
+| line | **92.71%** (492 of 6745 missed) |
 
-The lowest files are `DistributedBenchmark.swift` (79.12% region),
-`TCPTransport.swift` (81.25%) and `Rendezvous.swift` (84.44%). What remains
-uncovered is dominated by two things we did not chase: defensive code unreachable
+Region coverage fell from 89.98% when the RDMA transport (§4.6) landed, and the
+reason is worth stating rather than averaging away: two of its files are the
+least covered in the package, and neither can be covered on this hardware.
+`RDMAVerbs.swift` is 33.33% and `RDMATransport.swift` 39.51%, because the
+uncovered half of each is `SystemVerbs` — the code that calls Apple's librdma —
+and the connect/listen paths that need a queue pair to exist. The mock covers the
+logic above them (`RDMAFraming.swift` 97.22%, `RDMAConnection.swift` 85.96%), but
+nothing can execute a real `ibv_post_send` without a Thunderbolt 5 cable. Those
+percentages should rise on the first machine that has one; until then they are an
+accurate measure of exactly what has not been run.
+
+Excluding the two hardware-bound files, the rest is where it was. The next lowest
+are `DistributedBenchmark.swift` (78.72% region), `TCPTransport.swift` (81.25%)
+and `Rendezvous.swift` (84.53%). What remains uncovered there is dominated by two
+things we did not chase: defensive code unreachable
 without injecting faults into libc — `EINTR` retry loops, `socket()` returning a
 negative descriptor, `getsockopt` failing on a live descriptor — and the
 cross-machine paths, whose error branches need two machines and a cable pulled
@@ -1256,7 +1268,7 @@ error-feedback argument does not hold.
 The implementation is complete enough to evaluate: all five collectives across
 five dtypes and five reductions, three executable plans, three wire codecs, a
 probe, a planner, a C ABI validated by a compiled C client, and a benchmark
-harness, an MLX adapter and a data-parallel training demo — 309 tests at 89.98%
+harness, an MLX adapter and a data-parallel training demo — 379 tests at 87.06%
 region coverage, run in CI on every push, and no external dependencies outside
 the MLX target. The
 first real-hardware measurement puts a direct Thunderbolt link at 1.06 GB/s and

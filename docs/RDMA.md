@@ -273,7 +273,7 @@ Being precise about this matters more than the feature.
   instructions, and `mcclbench --transport rdma --distributed` refuses at parse
   time quoting it.
 
-**Verified against a mock that enforces TN3205's rules** (`MockVerbs`, 66 tests):
+**Verified against a mock that enforces TN3205's rules** (`MockVerbs`, 70 tests):
 
 - Reset → Init → RTR → RTS in that order, with attribute masks 57 / 1,053,057 /
   65,537 — the values TN3205's listings imply.
@@ -572,4 +572,4 @@ machines Apple's stack cannot use.
 | `Sources/MCCL/RDMA/RDMAConnection.swift` | queue-pair lifecycle, ring, completion arbitration |
 | `Sources/MCCL/RDMA/RDMATransport.swift` | `Transport`/`Listener`/`Channel`, availability, device pairing |
 | `Tests/MCCLTests/RDMAMockVerbs.swift` | the mock that enforces TN3205's rules |
-| `Tests/MCCLTests/RDMATests.swift` | 66 tests, three of them hardware-gated |
+| `Tests/MCCLTests/RDMATests.swift` | 70 tests, three of them hardware-gated |

@@ -1138,7 +1138,7 @@ the absence of the optimiser rather than the kernel.
   implements `listen`/`connect` over Apple's TN3205 verbs and everything above it is
   unchanged, which is what the `Transport` seam was for. It has never run on a
   Thunderbolt 5 machine, because every machine here is M1-generation with TB4. It is
-  verified by compilation on SDKs with and without the verbs header, and by 66 tests
+  verified by compilation on SDKs with and without the verbs header, and by 70 tests
   against a mock that enforces the technote's rules. docs/RDMA.md holds the validation
   checklist. Where RDMA is unavailable, TB is still reached as ordinary IP over the
   Thunderbolt bridge.

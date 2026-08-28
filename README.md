@@ -105,7 +105,7 @@ Milestones 1–4 are implemented and tested; milestone 5 is nearly complete — 
 shim, the benchmark harness and the MLX adapter are all in, and the one piece
 still missing is blocked upstream rather than here.
 
-**377 tests, all passing** (343 for the core library, 34 for the MLX adapter, which
+**379 tests, all passing** (345 for the core library, 34 for the MLX adapter, which
 lives in its own test target so that `MCCL`'s tests never acquire an MLX
 dependency), run in CI on macOS arm64 on every push. First real-hardware
 validation: two Mac Studio M1 Max machines on a
