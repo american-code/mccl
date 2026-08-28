@@ -2,7 +2,7 @@
 
 A practical guide: probe a cluster, bring a communicator up, run collectives,
 compress the wire, link from C, benchmark, and — at the end — pick up one of the
-pieces that is not built yet.
+pieces that is not finished yet.
 
 Every code block below was compiled and run before it was written down. The
 transcripts are real output from an Apple M1 Pro (16 GB, macOS 26.5.1, Swift
@@ -1852,7 +1852,8 @@ problem is a 167.8 µs round trip and a 1.06 GB/s link against a GPU that finish
 step in single-digit milliseconds. The two ways to move the line are more compute per
 byte communicated (larger batches, gradient accumulation, or a regime where
 activations rather than parameters dominate) or a faster fabric — which is what the
-unbuilt bulk-DMA Thunderbolt transport is for.
+RDMA-over-Thunderbolt transport is for, once there is Thunderbolt 5 hardware to run
+it on ([RDMA.md](RDMA.md)).
 
 #### Correctness on the cluster
 
@@ -1914,7 +1915,7 @@ change to the lab machines rather than a measurement. [COMPARISON.md](COMPARISON
 A genuine head-to-head would need mlx-swift to expose `mlx::distributed`, or a
 build of mlx-swift with those sources put back in.
 
-### Thunderbolt transport
+### Writing a transport
 
 **The seam is `Transport`** (`Sources/MCCL/Transport.swift`), three requirements:
 
@@ -1926,10 +1927,17 @@ public protocol Transport: AnyObject {
 }
 ```
 
-Today Thunderbolt is reached as ordinary IP over the TB bridge, so `TCPTransport`
-already works across it — what is missing is bulk DMA rather than a TCP stack in
-the path. Everything above the transport is unchanged: `MeshFabric`, the
+Three implementations exist: `TCPTransport`, the in-process `LoopbackTransport`,
+and `RDMATransport` over Apple's Thunderbolt verbs (macOS 26.2+, Thunderbolt 5 —
+see [RDMA.md](RDMA.md), and note it has not been run on hardware). Where RDMA is
+unavailable, Thunderbolt is reached as ordinary IP over the TB bridge and
+`TCPTransport` works across it unchanged.
+
+Everything above the transport is unchanged in every case: `MeshFabric`, the
 planner, the collectives and the codecs never learn which transport answered.
+`RDMATransport` is the worked example of that claim — it needed no change above
+the seam, and one instructive change *at* it, since a queue pair has no listener
+of its own and borrows a TCP channel for bootstrap.
 
 What a new transport must provide:
 

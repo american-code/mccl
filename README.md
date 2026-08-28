@@ -13,8 +13,8 @@ on by a measured rule — *a codec pays only when the fabric's uncompressed all-
 is below that codec's own encode/decode ceiling* — which puts the advantage exactly where
 CUDA clusters are weakest, on commodity interconnects. The planner likewise solves the
 fabric from probed bandwidth and latency instead of assuming it. Where the CUDA stack is
-still ahead — RDMA fabrics, scale beyond the three nodes validated here, ecosystem
-maturity — is stated alongside the case, in
+still ahead — a validated RDMA fabric, scale beyond the three nodes tested here,
+ecosystem maturity — is stated alongside the case, in
 [WHITEPAPER.md §3](docs/WHITEPAPER.md#3-value-proposition-competing-with-the-cuda-cluster-stack).
 
 ## What it does (design goals)
@@ -30,18 +30,55 @@ maturity — is stated alongside the case, in
   `libmccl.dylib`) mirrors the `ncclComm_t` idiom so non-Swift runtimes can adopt it
   by renaming `nccl` to `mccl`.
 
+## Does this still stand now that Apple ships RDMA and JACCL?
+
+Partly no, and the honest boundary is worth drawing before anything else.
+
+macOS 26.2 added RDMA over Thunderbolt 5, co-developed with **JACCL** — the
+`jaccl` backend of MLX Distributed, in `ml-explore/mlx`, MIT-licensed.
+
+**If you have a uniform Thunderbolt 5 mesh and you are running MLX, use JACCL.**
+It is Apple's, built alongside the silicon, in-tree, tested on the hardware, and
+one argument to select. mccl's RDMA transport is written to the same technote and
+has never been run on hardware. The same largely applies to C++ workloads on a
+uniform TB5 mesh: JACCL builds standalone and exposes a C++ API, so it is not
+MLX-only.
+
+**What mccl is for** is the rest of the space, which is most of it:
+
+- **A C ABI.** `libmccl.dylib` behind `mccl.h`, in NCCL's idiom — llama.cpp, a
+  `ctypes` binding, any non-C++ runtime. JACCL's surface is C++.
+- **Mixed fabrics.** JACCL is RDMA-only and has no data path off the mesh. mccl
+  forms one world across a Thunderbolt island plus an Ethernet or Wi-Fi bridge
+  rank, each pair on the best cable the two share, islands detected from measured
+  bandwidth. That is the shape of a cluster built from machines you already owned,
+  and it is measured here on hardware.
+- **Compression where the fabric is slow** — which is exactly where RDMA is not
+  available. The two are complements, not competitors.
+- **A measured topology planner** in the library rather than a matrix handed to it.
+
+And mccl's RDMA transport speaks the same TN3205 verbs JACCL rides, so on the
+hardware where Apple's stack is right, mccl meets it rather than competing with
+it. [docs/RDMA.md](docs/RDMA.md#where-this-stands-next-to-apples-own-stack) has
+the point-by-point comparison.
+
 ## Documentation
 
 - **[docs/USAGE.md](docs/USAGE.md)** — the practical guide. Probe a cluster, bring
   a communicator up three different ways, run every collective, use every codec,
   link from C, train data-parallel with MLX, read `mcclbench` output. Every
   example in it was compiled and run before it was written down. Ends with
-  concrete starting points for the three pieces that are not built yet.
+  concrete starting points for the pieces that are not finished yet.
 - **[docs/WHITEPAPER.md](docs/WHITEPAPER.md)** — the design argument and the
   measured evaluation: why the interconnect rather than compute is the
   constraint, the closed-form ring/tree crossover, ratio-gap island detection,
   why top-k is an algorithm and not a codec, and what the numbers do and do not
   establish.
+- **[docs/RDMA.md](docs/RDMA.md)** — the RDMA-over-Thunderbolt transport: what
+  Apple's TN3205 verbs subset offers, the linkage strategy, why the framing looks
+  the way it does, how a UC queue pair's unreliability is handled, exactly what is
+  and is not verified, the validation checklist for the first user with
+  Thunderbolt 5 hardware, and where mccl stands next to Apple's own JACCL.
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — component-level design notes.
 - **[docs/COMPARISON.md](docs/COMPARISON.md)** — measured efficiency vs. published
   NCCL numbers, and the codec-crossover rule NCCL has no equivalent of.
@@ -52,7 +89,7 @@ Milestones 1–4 are implemented and tested; milestone 5 is nearly complete — 
 shim, the benchmark harness and the MLX adapter are all in, and the one piece
 still missing is blocked upstream rather than here.
 
-**309 tests, all passing** (275 for the core library, 34 for the MLX adapter, which
+**377 tests, all passing** (343 for the core library, 34 for the MLX adapter, which
 lives in its own test target so that `MCCL`'s tests never acquire an MLX
 dependency), run in CI on macOS arm64 on every push. First real-hardware
 validation: two Mac Studio M1 Max machines on a
@@ -144,6 +181,18 @@ for the tables, the method, and the ceilings measured per chip.
 - **Transports.** `Transport` / `Listener` / `Channel` over POSIX sockets (`TCPTransport`)
   and in-process (`LoopbackTransport`). No external package dependencies. `MeshFabric`
   brings up a full rank-addressed mesh.
+- **RDMA over Thunderbolt — built to specification, untested on hardware.** macOS 26.2
+  added an InfiniBand Verbs API for the Thunderbolt 5 controller (Apple's
+  [TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt)),
+  and `RDMATransport` implements the existing `Transport` seam over it: UC queue pairs,
+  a page-aligned registered slot ring, queue-pair metadata exchanged over the TCP
+  bootstrap channel mccl already had. It compiles with or without the SDK header and
+  binds librdma with `dlopen`, so a build on macOS 14 is unaffected;
+  `RDMATransport.isAvailable` reports which of "no library", "no devices" or "not
+  enabled" applies. **Every machine here is M1-generation with Thunderbolt 4, so none
+  of this has moved a byte over a queue pair.** The state machine and framing are
+  tested against a mock that enforces TN3205's rules; hardware validation is
+  [a checklist](docs/RDMA.md#validation-checklist) waiting for a first TB5 user.
 - **Probe.** `mcclprobe serve` / `mcclprobe measure` measure real pairwise bandwidth
   (large streaming transfers) and RTT (small ping-pong), including peer-to-peer links
   measured by the peers themselves. The resulting `Topology` is JSON-persistable, and
@@ -203,7 +252,9 @@ for the tables, the method, and the ceilings measured per chip.
 - **A crossover constant that matches measurement.** The closed form has the right
   shape and is 4–13× low on uniform Wi-Fi, because it assumes one bandwidth. It lands
   correctly on the mixed fabric, where the bottleneck really is one constant.
-- Thunderbolt-specific transport (bulk DMA rather than IP-over-TB).
+- **RDMA on real Thunderbolt 5.** The transport is written and tested against a mock;
+  no part of it has run on hardware, because there is none here. See
+  [docs/RDMA.md](docs/RDMA.md).
 - A rendezvous *service*. `Rendezvous` closes the gap the C ABI needs — one round
   trip through rank 0 — but there is no discovery, no membership change, and no
   recovery from a rank restarting.

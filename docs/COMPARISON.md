@@ -35,9 +35,10 @@ denominator its own numbers were produced against.
 
 Two denominators, both honest. Against the raw line, mccl's 25–30% sits below
 NCCL-over-TCP's 32–48%; the difference is the IP-over-TB tax that the probe itself
-pays, which a bulk-DMA transport would attack. Against what the link demonstrably
-carried in the same session — the fraction mccl's own scheduling controls — the
-collective extracts 70%.
+pays, and which mccl's RDMA transport is built to avoid — though it has never run
+on hardware, so that remains a prediction rather than a column in this table (see
+docs/RDMA.md). Against what the link demonstrably carried in the same session —
+the fraction mccl's own scheduling controls — the collective extracts 70%.
 
 ## The compression comparison NCCL cannot enter
 
@@ -176,3 +177,41 @@ runtimes as much as two schedulers, so it belongs in the "sanity check on the fa
 column rather than the verdict column. And a genuine same-language comparison needs
 mlx-swift to expose `mlx::distributed`, or a build of mlx-swift with those sources put
 back in — that, not lab access, is the real blocker.
+
+## Against JACCL, Apple's own collective library
+
+`ml-explore/mlx` now ships **JACCL** — "Jack and Angelos' Collective Communication
+Library", the `jaccl` backend of MLX Distributed, co-developed with the RDMA-over-
+Thunderbolt hardware support and linked directly from Apple's TN3205. It is
+MIT-licensed and, contrary to a natural assumption, builds standalone from the MLX
+tree with a C++ API: Apple's WWDC26 session 233 says it "can be built without MLX"
+and "is not limited to machine learning".
+
+**No numbers are offered here, because none would be honest.** mccl's RDMA
+transport has never run on hardware, so there is no measured mccl-over-RDMA figure
+to place beside anything. Apple has published no JACCL microbenchmark table
+either; the MLX documentation's claim is a ratio ("communication latency an order
+of magnitude lower than the ring backend") with no absolute figure, and the WWDC
+figures are end-to-end MLX throughput on a 4× M3 Ultra cluster rather than
+collective bandwidth. A table here would be two blanks and a rumour.
+
+What can be compared is scope.
+
+| | JACCL | mccl |
+|---|---|---|
+| Fabric | RDMA over TB5 only; no TCP data path | TCP anywhere, RDMA where available, mixed in one world |
+| Hardware floor | Apple silicon with TB5, macOS 26.2+ | any Mac; RDMA is an optional accelerant |
+| Interface | C++ | C ABI (`libmccl.dylib`), plus Swift |
+| Topology | validated against a matrix supplied to it; discovery is a separate ssh helper | measured in-process by `mcclprobe`, planned per collective and message size |
+| Heterogeneous fabrics | not addressed | per-pair path selection, ratio-gap islands, hierarchical plans |
+| Wire compression | none | int8 / downcast / top-k, with the measured crossover rule above |
+| Collectives | `all_sum`, `all_max`, `all_min`, `all_gather`, `send`, `recv`, `barrier` | plus `broadcast`, `reduce`, `reduce_scatter` |
+| Algorithm choice | size-based (single-phase below a threshold, reduce-scatter + all-gather above) | solved from measured bandwidth and latency |
+| RDMA validated on hardware | yes, by Apple | **no** |
+
+**The row that matters most is the last one.** On a uniform TB5 mesh, JACCL is the
+better choice and this document should not pretend otherwise. The rows above it
+describe where mccl is not competing with JACCL at all: a C ABI for runtimes that
+cannot link C++, and fabrics that are not a uniform TB5 mesh — which is where the
+compression rule at the top of this document earns its keep, since a codec pays
+only on links slow enough that RDMA was never an option.

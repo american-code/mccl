@@ -12,7 +12,8 @@ Planner          ring vs. tree vs. hierarchical, chosen per (topology, message s
         ▼
 Wire layer       framing, in-flight compression/quantization, error feedback state
         ▼
-Transports       Thunderbolt (peer-to-peer IP over TB), Ethernet (TCP/QUIC), loopback
+Transports       RDMA over Thunderbolt 5 (verbs, TN3205), IP over TB, Ethernet (TCP),
+                 loopback
 ```
 
 ## Probe
@@ -422,6 +423,41 @@ consequence of the format growing: the marker is bumped rather than the new host
 smuggled somewhere an old parser would skip. The same rule governs the address table
 itself — rank 0 sends the old one-address-per-rank shape unless some rank really is
 multi-homed, so a single-homed world never sees a frame an older build could not read.
+
+## RDMA over Thunderbolt
+
+**Untested on hardware.** macOS 26.2 exposes InfiniBand Verbs over the Thunderbolt 5
+controller (Apple's TN3205), and `RDMATransport` implements the `Transport` protocol
+over it with nothing above the seam changed. Every machine here is M1-generation with
+Thunderbolt 4, so none of it has run. [RDMA.md](RDMA.md) is the full account — the
+verbs subset, the linkage strategy, the framing, the failure model, exactly what is
+verified, the validation checklist, and where mccl stands next to Apple's JACCL. The
+component-level summary:
+
+- **Linkage is split by risk.** Compile time uses Apple's SDK header behind
+  `__has_include`, so struct layouts and enum values are Apple's rather than a
+  transcription. Link time uses `dlopen`/`dlsym` and no `-lrdma`, because `-lrdma` is
+  a hard link error on every pre-26.2 SDK — including CI's. The built binaries carry
+  no load-time reference to librdma, and the constants mccl hard-codes are
+  cross-checked against the SDK's enums by `_Static_assert`.
+- **Framing follows from the same-size rule.** TN3205 requires sender and receiver to
+  post messages the same number of frames long, and receives are posted before their
+  messages exist, so the size is fixed for the life of the connection (64 KiB by
+  default) and negotiated during the queue-pair metadata exchange. The rule then holds
+  by construction rather than by agreement.
+- **Loss is surfaced, not repaired.** UC queue pairs do not retransmit and Thunderbolt
+  does not acknowledge in hardware. Every slot carries a sequence number; a gap is a
+  hard error. A retransmit protocol over UC would reimplement TCP, and a silently
+  dropped slot in an all-reduce is a plausible-looking tensor with a hole in it.
+- **Bootstrap reuses what existed.** TN3205 wants queue-pair metadata exchanged over
+  TCP, which is the channel `MeshFabric` already dials, so `RDMATransport` wraps
+  `TCPTransport` and the rendezvous is untouched. Device selection reuses the subnet
+  match too: `rdma_en2` pairs with `en2`.
+- **`.rdma` is a new `InterfaceMedia`**, first in `PathSelection.mediaOrder`, and it
+  implies `thunderbolt5` with no measurement — the API ships nowhere else.
+- **Availability reports a reason**, following triton-metal's `tm_unusable_reason`
+  shape: no verbs header at build time, no librdma at run time, or no devices (which
+  from user space cannot be distinguished from "not enabled", so both are named).
 
 ## Benchmarks
 
@@ -1037,8 +1073,8 @@ gains only from the hoist.
 is structural: reduction runs once per received chunk while a codec runs twice per call,
 and `none` was never codec-bound. On the 1.06 GB/s Thunderbolt cable a 16.9 GB/s kernel
 already spends only ~6% of the wall clock. The cases where it matters are the ones where
-the fabric is not the bottleneck — in-process and loopback worlds, a future bulk-DMA
-transport, and the reduction that top-k's gathered blocks feed.
+the fabric is not the bottleneck — in-process and loopback worlds, the RDMA transport,
+and the reduction that top-k's gathered blocks feed.
 
 Semantics did not move. `ReduceKernelTests` pins every `(dtype, op)` pair element-for-element
 against an independently written reference, including the fp16/bf16 rounding, the integer
@@ -1098,9 +1134,14 @@ the absence of the optimiser rather than the kernel.
 - **n = 4 with two islands of two, on hardware.** The lab has three machines, so the
   two-island shape the hierarchical plan was originally written for is still only tested
   in the suite. And nothing measured anywhere here says what happens at sixteen nodes.
-- **Thunderbolt-specific transport.** The `Transport` protocol is the seam: a bulk-DMA
-  TB transport implements `listen`/`connect` and everything above it is unchanged.
-  Today TB is reached as ordinary IP over the Thunderbolt bridge.
+- **RDMA over Thunderbolt, on hardware.** The transport is built — `RDMATransport`
+  implements `listen`/`connect` over Apple's TN3205 verbs and everything above it is
+  unchanged, which is what the `Transport` seam was for. It has never run on a
+  Thunderbolt 5 machine, because every machine here is M1-generation with TB4. It is
+  verified by compilation on SDKs with and without the verbs header, and by 66 tests
+  against a mock that enforces the technote's rules. docs/RDMA.md holds the validation
+  checklist. Where RDMA is unavailable, TB is still reached as ordinary IP over the
+  Thunderbolt bridge.
 - **A real rendezvous service.** `Rendezvous` is one round trip through rank 0 —
   enough for `mcclCommInitRank`, not enough for a long-lived cluster. No discovery, no
   membership change, no recovery from a rank restarting, no reconnection.

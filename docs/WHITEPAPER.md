@@ -194,12 +194,15 @@ batch 256, break even between 1,024 and 4,096, and reach 1.45× of a 2.0× ceili
 at 16,384 (§6.1e).
 
 **Where the CUDA stack remains ahead.** Three places, and they are not small.
-*Fabric:* mccl is TCP/IP only. Thunderbolt is reached as IP over the TB bridge and
-gives up 42–58% of line rate to the stack before mccl runs — the two probes of the
-same cable in §6.1 bracket it — so against the
-raw line mccl's 25–30% sits below NCCL-over-TCP's published 32–48%, and an
-RDMA-class fabric is out of reach entirely until the bulk-DMA transport of §7
-exists. *Scale:* the planner is validated at n = 3 on both a uniform and a mixed
+*Fabric:* every measurement in this paper was taken over TCP/IP, with Thunderbolt
+reached as IP over the TB bridge, which gives up 42–58% of line rate to the stack
+before mccl runs — the two probes of the same cable in §6.1 bracket it — so against
+the raw line mccl's 25–30% sits below NCCL-over-TCP's published 32–48%. An
+RDMA-class fabric is no longer out of reach as an *API*: macOS 26.2 exposes
+InfiniBand Verbs over Thunderbolt 5 (Apple's TN3205), and mccl has a transport
+built to it (§4.6). It is out of reach as *evidence*, which is the part that
+counts here — that transport has never run on hardware, because Thunderbolt 5 is
+what this lab does not have. *Scale:* the planner is validated at n = 3 on both a uniform and a mixed
 fabric, and the hierarchical plan now has hardware evidence — but only in its
 smallest form, one island of two plus one bridge rank. Two islands of two is
 tested in the suite and not on hardware, because the lab has three machines; and
@@ -211,6 +214,51 @@ queue, what overlaps is the caller's work with the collective — not two
 collectives with each other, as it would be on independent CUDA streams (§5).
 The head-to-head against MLX's own ring that would settle the Mac-side
 comparison is blocked upstream (§7).
+
+### 3.1 Does mccl still stand now that Apple ships RDMA and JACCL?
+
+The question is fair and the answer is partly no, so it is worth answering
+directly rather than around.
+
+Apple co-developed RDMA over Thunderbolt with **JACCL** — "Jack and Angelos'
+Collective Communication Library", named for Jack Beasley, who led the RDMA work
+— which is the `jaccl` backend of MLX Distributed. It lives in `ml-explore/mlx`,
+is MIT-licensed, and TN3205 links to it directly.
+
+**Where Apple's work supersedes this one.** For a uniform Thunderbolt 5 mesh
+running MLX, use JACCL. It is Apple's, co-developed with the silicon, in-tree,
+validated on the hardware, and selected with a single argument. mccl's RDMA
+transport is written to the same technote and has never been run. There is no
+reading of the evidence on which mccl is the better choice for that case. The
+same largely holds for a C++ workload on a uniform TB5 mesh: JACCL builds
+standalone from the MLX tree and exposes a C++ API — Apple's WWDC26 session 233
+says it "can be built without MLX" and "is not limited to machine learning" — so
+"JACCL is only for MLX" is a convenient claim and a false one.
+
+**Where this work is not superseded.** Four things, and they are narrow:
+
+1. **A C ABI.** mccl's artifact is `libmccl.dylib` behind a hand-written `mccl.h`
+   in NCCL's idiom. llama.cpp, a `ctypes` binding, a Rust or Go runtime — anything
+   that speaks C — links it. JACCL's surface is C++.
+2. **Mixed fabrics.** JACCL is RDMA-only: it has no data path to a node that is
+   not on the Thunderbolt mesh. mccl forms one world across a Thunderbolt island
+   and an Ethernet or Wi-Fi bridge rank, with each pair on the best cable the two
+   of them share (§4.5), islands detected from measured bandwidth (§4.2), and a
+   hierarchical plan over the result. §6.1f is that run, on hardware. A cluster
+   assembled from machines someone already owned is usually this shape.
+3. **Compression where the fabric is slow.** §4.3's rule pays exactly where links
+   are slow — which is precisely where RDMA is unavailable. JACCL does no wire
+   compression. The two are complements: RDMA makes fast links faster, compression
+   makes slow links usable, and mccl is the library that has to decide which
+   applies per link.
+4. **A measured topology planner inside the library**, rather than a topology
+   matrix supplied to it out of band.
+
+**And the transport is not a competing fabric.** mccl speaks the same TN3205 verbs
+JACCL rides. Where Apple's stack is the right answer, mccl meets it rather than
+routing around it — the same queue pairs and the same constraints, reached through
+a C ABI and a planner that also work on the machines Apple's stack cannot use.
+docs/RDMA.md has the point-by-point comparison.
 
 ---
 
@@ -399,6 +447,59 @@ being smuggled somewhere an old parser would skip: a single-homed cluster's
 tokens remain byte-identical, and a multi-homed one's are honestly labelled as
 something an older build cannot read.
 
+### 4.6 An RDMA transport, built to a specification rather than to a measurement
+
+macOS 26.2 added an InfiniBand Verbs API for the Thunderbolt 5 controller, and
+Apple documented it in Technical Note TN3205. `RDMATransport` implements the
+`Transport` protocol over it. Nothing above the seam changed, which is the
+clearest evidence available that the seam was drawn in the right place.
+
+**This section describes code that has never run on hardware.** Every machine in
+this lab is M1-generation with Thunderbolt 4; the API needs Thunderbolt 5. What
+follows is design and its justification, not evaluation, and §7 states the
+boundary again in the terms a reader should hold it to.
+
+The verbs subset is small and its constraints are load-bearing: two-sided
+`IBV_WR_SEND`/`post_recv` only, unreliable-connection queue pairs, ten of them,
+one port, 4 KiB frames, 4095 work requests, a 16,773,120-byte message ceiling,
+page-aligned buffers behind an IOMMU, and queue-pair metadata exchanged out of
+band. Two constraints determined the design.
+
+**The same-size rule determines the framing.** TN3205 requires sender and receiver
+to post messages the same number of frames long, and a receive buffer must be
+posted before its message arrives — so the receiver must know a size it has not
+been told. Announcing each size first turns every payload into two messages and
+puts a round trip in front of every write, which on a fabric bought for latency is
+the wrong trade, and does not even close the regress: the announcement is itself a
+message needing an agreed size. mccl instead fixes one size for the life of the
+connection, negotiated during the metadata exchange, so the rule holds by
+construction. Writes chunk across slots; the padding a short write costs is paid
+once per collective step rather than once per header, because `sendFrame` already
+emits its header and payload as a single write.
+
+**The absence of hardware acknowledgement determines the failure model.** A UC
+queue pair does not retransmit, and TN3205 says plainly that send completion does
+not mean the data arrived or arrived intact. A Thunderbolt cable is reliable in
+practice — short, point-to-point, CRC-protected, which is why Apple considers UC
+sufficient — but a collectives library may not quietly depend on that. A dropped
+slot in an all-reduce does not announce itself; it becomes a plausible tensor with
+a hole in it, and then it trains a model. So every slot carries a sequence number,
+the receiver checks it, and a gap is a hard error. mccl attempts no recovery: a
+retransmit protocol over UC would reimplement what TCP already provides, and a
+cluster that needs one should use TCP. What this does *not* catch is corruption
+within a delivered slot, which is stated in docs/RDMA.md rather than left for a
+reader to discover.
+
+The bootstrap reuses machinery that already existed. TN3205 suggests TCP over
+IP-over-Thunderbolt for the metadata exchange, which is exactly the channel
+`MeshFabric` already dials, so `RDMATransport` wraps `TCPTransport` and the
+rendezvous, per-pair addressing and announcement checks are untouched. Device
+selection is likewise a reuse: `rdma_en2` pairs with `en2`, so the device for a
+peer follows from the subnet match `PathSelection` already performs. Interfaces
+with a paired device become a new `.rdma` medium that sorts first — and that
+implies Thunderbolt 5 outright, since the API ships nowhere else, making it the
+one link-generation claim on the machine that needs no measurement at all.
+
 ---
 
 ## 5. Implementation
@@ -410,8 +511,9 @@ external package dependencies**. The transports are POSIX sockets directly.
 **Transport stack.** The layering is `Collectives → Planner → Wire → Transport`,
 and the seam that matters is the `Transport` protocol: `listen` returning a
 `Listener`, `connect` returning a `Channel`, both blocking. `TCPTransport` and an
-in-process `LoopbackTransport` implement it today; a Thunderbolt bulk-DMA
-transport would slot in with no change above it. `MeshFabric` builds a full
+in-process `LoopbackTransport` implement it, and `RDMATransport` (§4.6) implements
+it over Apple's Thunderbolt verbs with nothing above it changed — which is the
+concrete demonstration that the seam is the right one. `MeshFabric` builds a full
 rank-addressed mesh rather than only ring neighbours, because tree and
 hierarchical plans need non-adjacent edges and the plan is chosen per operation,
 after the fabric exists. Bring-up is deadlock-free by an ordering rule — for each
@@ -490,9 +592,11 @@ Four things this establishes, and one it does not.
 reported for NCCL over TCP sockets — the right comparison, since mccl reaches
 Thunderbolt as IP over the TB bridge and pays the same stack costs. That is
 evidence the methodology is sound and the framing layer has no gross
-inefficiency, and simultaneously the strongest available argument for the
-bulk-DMA transport of §7: roughly 58% of the link is lost here to a protocol stack
-a direct transport would not traverse.
+inefficiency, and simultaneously the strongest available argument for the RDMA
+transport of §4.6: roughly 58% of the link is lost here to a protocol stack a
+queue pair does not traverse. Whether the RDMA transport recovers it is unmeasured
+— it needs Thunderbolt 5 hardware — and the expectation is recorded as a
+falsifiable prediction in docs/RDMA.md rather than as a result.
 
 **The same cable reads 1.46 GB/s under per-pair path probing** (§6.1f, 213.7 µs),
 which is 58.4% of the same line rate. The two probes differ in which address each
@@ -738,7 +842,7 @@ has a NaN branch, so it stays scalar and gains only from the hoist.
 The collective-level value is smaller than §6.1b's, and predictably: reduction runs
 once per received chunk against a codec's twice per call, so on a 1.06 GB/s cable a
 16.9 GB/s kernel was already only ~6% of the wall clock. It matters where the fabric is
-not the bottleneck — in-process and loopback worlds, a future bulk-DMA transport, and
+not the bottleneck — in-process and loopback worlds, an RDMA transport, and
 top-k's accumulation of gathered blocks.
 
 ### 6.1d Topology selection at n = 3
@@ -1073,11 +1177,16 @@ fabric rather than a verdict on either implementation. A genuine head-to-head
 needs mlx-swift to expose `mlx::distributed`, or a build of it with those sources
 restored.
 
-**No Thunderbolt-specific transport.** Thunderbolt is reached as ordinary IP over
-the TB bridge, and the 42–58% of line rate the probe does not reach in §6.1 is the
-direct cost. A bulk-DMA transport implementing `listen`/`connect` would leave
-everything above it unchanged, and is the largest identified performance
-opportunity in the system.
+**The RDMA transport has never run on hardware.** macOS 26.2 exposes InfiniBand
+Verbs over Thunderbolt 5 and mccl implements `listen`/`connect` over it (§4.6),
+leaving everything above unchanged. Every machine available here is
+M1-generation with Thunderbolt 4, so the transport is verified only by
+compilation and by a mock that enforces TN3205's published rules — the queue-pair
+lifecycle and its attribute masks, the same-size framing rule, chunking and
+reassembly, sequence-gap detection, and teardown. The 42–58% of line rate lost to
+the IP stack in §6.1 is what it exists to recover, and whether it does is the
+largest open question in the system rather than a claimed result. docs/RDMA.md
+states exactly what is verified and gives the checklist that would settle it.
 
 **The probe does not report which route a link-local address reached.** §6.1 and
 §6.1f read the same cable at 1.06 and 1.46 GB/s, and the difference is which of a
