@@ -26,6 +26,7 @@ enum ResultCode: Int32 {
     case unsupportedCompression = 10
     case topologyInvalid = 11
     case internalError = 12
+    case rdmaFailure = 13
 
     init(_ error: MCCLError) {
         switch error {
@@ -40,6 +41,11 @@ enum ResultCode: Int32 {
         case .timedOut: self = .timedOut
         case .unsupportedCompression: self = .unsupportedCompression
         case .topologyInvalid: self = .topologyInvalid
+        case .rdmaFailure, .rdmaCompletionFailed, .rdmaUnavailable: self = .rdmaFailure
+        // A lost slot on an unreliable-connection queue pair is precisely a
+        // wire protocol violation, and reporting it as one keeps a C caller's
+        // existing handling correct without teaching it about RDMA.
+        case .rdmaSequenceGap: self = .protocolViolation
         }
     }
 
@@ -58,6 +64,7 @@ enum ResultCode: Int32 {
         case .unsupportedCompression: return "mcclUnsupportedCompression"
         case .topologyInvalid: return "mcclTopologyInvalid"
         case .internalError: return "mcclInternalError"
+        case .rdmaFailure: return "mcclRdmaFailure"
         }
     }
 }

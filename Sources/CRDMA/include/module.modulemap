@@ -1,0 +1,4 @@
+module CRDMA {
+    header "crdma.h"
+    export *
+}

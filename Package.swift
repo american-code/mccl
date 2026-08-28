@@ -32,7 +32,13 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.0"),
     ],
     targets: [
-        .target(name: "MCCL"),
+        // The RDMA-over-Thunderbolt shim: the only code in the package that
+        // includes <infiniband/verbs.h>. It carries no linker settings on
+        // purpose — `-lrdma` is a hard error on any SDK older than macOS 26.2,
+        // so librdma is bound with dlopen/dlsym instead and this target builds
+        // on every SDK. See the comment at the top of Sources/CRDMA/include/crdma.h.
+        .target(name: "CRDMA"),
+        .target(name: "MCCL", dependencies: ["CRDMA"]),
         // `include` holds the hand-written C header, which is documentation and
         // a compile-time contract for C callers — not a Swift source or resource.
         .target(name: "MCCLShim", dependencies: ["MCCL"], exclude: ["include"]),

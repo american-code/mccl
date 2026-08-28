@@ -67,7 +67,15 @@ typedef enum {
     mcclTopologyInvalid        = 11,
     /* An error that did not originate in mccl (an allocation failure, say). */
     mcclInternalError          = 12,
-    mcclNumResults             = 13
+    /*
+     * RDMA over Thunderbolt failed, or is unavailable on this machine. Call
+     * mcclGetLastError for which: the message distinguishes "no librdma"
+     * (macOS older than 26.2), "no devices" (no Thunderbolt 5 controller, or
+     * RDMA not enabled with `rdma_ctl enable`) and a verbs call that failed.
+     * A lost slot is reported as mcclProtocolViolation, not as this.
+     */
+    mcclRdmaFailure            = 13,
+    mcclNumResults             = 14
 } mcclResult_t;
 
 /* Static, human-readable name of a result code. Never NULL. */

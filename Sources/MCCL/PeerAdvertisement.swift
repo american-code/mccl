@@ -118,7 +118,10 @@ extension PeerAdvertisement {
             for interface in candidates where interface.media == media {
                 for address in interface.addresses where !address.isIPv6 {
                     let linkLocal = NetworkInterfaces.isLinkLocal(address)
-                    guard !linkLocal || media == .thunderbolt else { continue }
+                    // A 169.254/16 address is normal on any point-to-point
+                    // Thunderbolt link, RDMA-capable or not, and a symptom of a
+                    // failed configuration on anything else.
+                    guard !linkLocal || media == .thunderbolt || media == .rdma else { continue }
                     guard seen.insert(address.text).inserted else { continue }
                     endpoints.append(
                         PeerEndpoint(address: PeerAddress(host: address.text, port: port), media: media))
@@ -186,7 +189,19 @@ extension PeerAdvertisement {
 public enum PathSelection {
 
     /// Media, fastest first. The one place the ordering is written down.
-    public static let mediaOrder: [InterfaceMedia] = [.loopback, .thunderbolt, .ethernet, .wifi, .other]
+    ///
+    /// `.rdma` leads. It is the only kind here that names a *capability* rather
+    /// than a cable: an interface classifies as `.rdma` only when this machine
+    /// has a paired verbs device for it, which per TN3205 means Thunderbolt 5
+    /// with RDMA enabled. A pair that shares one is the fastest path either of
+    /// them has, and it is the only path that can skip the IP stack entirely.
+    ///
+    /// It ranks above `.loopback` on purpose, though the two never actually
+    /// compete: rule 4 drops loopback candidates for any dialer that has a
+    /// routable address of its own, and a rank with nothing but loopback has no
+    /// RDMA peer to reach.
+    public static let mediaOrder: [InterfaceMedia] =
+        [.rdma, .loopback, .thunderbolt, .ethernet, .wifi, .other]
 
     /// Rank of a media kind; lower sorts earlier. `nil` means "no local
     /// interface claims this address", which sorts after every known kind.

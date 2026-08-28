@@ -13,6 +13,13 @@ import SystemConfiguration
 /// from Wi-Fi from a Thunderbolt bridge; neither can tell TB4 from TB5, because
 /// both present as ordinary IP links. Generation is left to the measurement.
 public enum InterfaceMedia: String, Sendable, Codable, CaseIterable {
+    /// A Thunderbolt interface that has a paired RDMA device — `en2` when
+    /// `rdma_en2` exists. Distinct from `.thunderbolt` because it is strictly
+    /// more than a Thunderbolt link: it is one this machine can drive with
+    /// verbs, which per TN3205 means Thunderbolt 5 on macOS 26.2 or later with
+    /// RDMA enabled. That is the strongest statement any local API makes about
+    /// a cable's generation, and it is the reason this kind sorts first.
+    case rdma
     case thunderbolt
     case ethernet
     case wifi
@@ -76,6 +83,11 @@ public struct NetworkInterface: Sendable, Equatable {
         case .ethernet: return .ethernet
         case .wifi: return .wifi
         case .other: return nil
+        case .rdma:
+            // No measurement needed, and none would be better evidence: TN3205
+            // ships RDMA over Thunderbolt only on Macs with Thunderbolt 5, so a
+            // paired RDMA device settles the generation question outright.
+            return .thunderbolt5
         case .thunderbolt:
             // TB4/USB4 and TB5 are the same kind of link to every API on the
             // machine. Only throughput separates them, so use it when we have
@@ -99,6 +111,31 @@ public enum NetworkInterfaces {
     /// bridge from any other `en`/`bridge` device. Both are OS facilities — mccl
     /// still has no package dependencies.
     public static func local() -> [NetworkInterface] {
+        local(rdmaInterfaces: rdmaPairedInterfaces())
+    }
+
+    /// The BSD names of interfaces that have a paired RDMA device.
+    ///
+    /// Cached: enabling RDMA needs `rdma_ctl enable` and a reboot, and the
+    /// device set is per Thunderbolt port rather than per cable, so it does not
+    /// change while a process runs. Plugging a cable in changes a port's *state*,
+    /// which `RDMAConnection` checks at handshake time, not its existence.
+    static func rdmaPairedInterfaces() -> Set<String> {
+        rdmaCacheLock.lock()
+        defer { rdmaCacheLock.unlock() }
+        if let cached = rdmaCache { return cached }
+        let paired = Set(RDMATransport.deviceNames().compactMap(RDMATransport.interfaceName(pairedWith:)))
+        rdmaCache = paired
+        return paired
+    }
+
+    private static let rdmaCacheLock = NSLock()
+    nonisolated(unsafe) private static var rdmaCache: Set<String>?
+
+    /// The enumeration proper, with the RDMA pairing supplied rather than
+    /// discovered — which is how the tests exercise `.rdma` classification on
+    /// hardware that has no RDMA devices at all.
+    public static func local(rdmaInterfaces: Set<String>) -> [NetworkInterface] {
         var head: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&head) == 0, let first = head else { return [] }
         defer { freeifaddrs(head) }
@@ -141,7 +178,8 @@ public enum NetworkInterfaces {
             return NetworkInterface(
                 name: name,
                 media: classify(name: name, ifiType: types[name],
-                                isLoopback: isLoopback, displayName: described[name]),
+                                isLoopback: isLoopback, displayName: described[name],
+                                rdmaInterfaces: rdmaInterfaces),
                 displayName: described[name],
                 isUp: (interfaceFlags & UInt32(IFF_UP)) != 0,
                 isLoopback: isLoopback,
@@ -180,8 +218,12 @@ public enum NetworkInterfaces {
     private static let iftLoop: UInt8 = 0x18
     private static let iftBridge: UInt8 = 0xd1
 
-    static func classify(name: String, ifiType: UInt8?, isLoopback: Bool, displayName: String?) -> InterfaceMedia {
+    static func classify(name: String, ifiType: UInt8?, isLoopback: Bool, displayName: String?,
+                         rdmaInterfaces: Set<String> = []) -> InterfaceMedia {
         if isLoopback || ifiType == iftLoop || name.hasPrefix("lo") { return .loopback }
+        // Checked before anything else: a paired RDMA device is a harder fact
+        // than any name or display-name heuristic below it.
+        if rdmaInterfaces.contains(name) { return .rdma }
 
         if let displayName {
             let lowered = displayName.lowercased()
@@ -285,12 +327,14 @@ public enum NetworkInterfaces {
     /// other media it means the interface failed to configure.
     public static func preferredLocalAddress(among interfaces: [NetworkInterface]? = nil) -> String? {
         let candidates = (interfaces ?? local()).filter { $0.isUp && !$0.isLoopback }
-        let ranking: [InterfaceMedia] = [.thunderbolt, .ethernet, .wifi, .other]
+        let ranking: [InterfaceMedia] = [.rdma, .thunderbolt, .ethernet, .wifi, .other]
         for media in ranking {
             for interface in candidates where interface.media == media {
                 let v4 = interface.addresses.filter { !$0.isIPv6 }
                 if let routable = v4.first(where: { !isLinkLocal($0) }) { return routable.text }
-                if media == .thunderbolt, let selfAssigned = v4.first { return selfAssigned.text }
+                if media == .thunderbolt || media == .rdma, let selfAssigned = v4.first {
+                    return selfAssigned.text
+                }
             }
         }
         return nil
