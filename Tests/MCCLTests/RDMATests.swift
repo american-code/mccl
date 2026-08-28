@@ -1,4 +1,5 @@
 import XCTest
+import CRDMA
 @testable import MCCL
 
 /// Tests for the RDMA-over-Thunderbolt transport.
@@ -336,6 +337,33 @@ final class RDMAStateMachineTests: XCTestCase {
                       + "qps \(mock.liveQueuePairs)")
     }
 
+    /// Teardown must not wait out the operation timeout when the peer is gone.
+    /// The close notification is best-effort; the ring being full at teardown
+    /// usually means the peer already stopped reading.
+    func testCloseDoesNotBlockWhenTheSendRingIsFull() throws {
+        let mock = MockVerbs()
+        let geometry = try RDMASlotGeometry(slotBytes: 4096, slotCount: 2)
+        let a = try RDMAConnection(verbs: mock, deviceIndex: 0, deviceName: mock.devices[0],
+                                   geometry: geometry, packetSequenceNumber: 1)
+        let b = try RDMAConnection(verbs: mock, deviceIndex: 1, deviceName: mock.devices[1],
+                                   geometry: geometry, packetSequenceNumber: 2)
+        try a.connect(to: b.metadata)
+        try b.connect(to: a.metadata)
+
+        // Fill a's send ring: b never reads, so nothing completes.
+        let payload = [UInt8](repeating: 7, count: geometry.payloadCapacity)
+        for _ in 0..<(geometry.slotCount * 2) {
+            try payload.withUnsafeBytes { try a.send($0) }
+        }
+
+        let started = Date()
+        a.close()
+        b.close()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5,
+                          "close() waited on a completion that was never coming")
+        XCTAssertTrue(mock.isFullyReleased)
+    }
+
     func testCloseIsIdempotent() throws {
         let mock = MockVerbs()
         let a = try makeConnection(mock)
@@ -551,19 +579,28 @@ final class RDMADataPathTests: XCTestCase {
         // block does not stall the test.
         let payload = [UInt8](repeating: 0x5A, count: geometry.payloadCapacity * 12)
         let finished = DispatchSemaphore(value: 0)
+        let sendError = ErrorBox()
         DispatchQueue(label: "test.rdma.backpressure").async {
-            payload.withUnsafeBytes { try? a.send($0) }
+            do { try payload.withUnsafeBytes { try a.send($0) } } catch { sendError.value = error }
             finished.signal()
         }
 
-        // The sender must still be blocked: two slots have nowhere to go.
-        XCTAssertEqual(finished.wait(timeout: .now() + 0.25), .timedOut,
+        // Wait for the sender to *reach* the stall before asserting it is in one.
+        // Asserting at a fixed instant instead would be a bet on the scheduler
+        // having run the block by then, which under load is not a safe bet — and
+        // the property under test is not "it blocks within 250 ms", it is "it
+        // blocks until read".
+        let deadline = Date().addingTimeInterval(10)
+        while mock.outstandingSendCount == 0 && Date() < deadline { usleep(2000) }
+        XCTAssertGreaterThan(mock.outstandingSendCount, 0,
+                             "the sender should be holding slots the peer cannot yet take")
+        XCTAssertEqual(finished.wait(timeout: .now() + 0.1), .timedOut,
                        "a send larger than the receive ring should not complete unread")
-        XCTAssertGreaterThan(mock.outstandingSendCount, 0)
 
         var received = [UInt8](repeating: 0, count: payload.count)
         try received.withUnsafeMutableBytes { try b.receive(into: $0) }
-        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(finished.wait(timeout: .now() + 30), .success)
+        XCTAssertNil(sendError.value)
         XCTAssertEqual(received, payload)
         XCTAssertEqual(mock.outstandingSendCount, 0)
     }
@@ -623,6 +660,16 @@ final class RDMADataPathTests: XCTestCase {
         }
         XCTAssertEqual(intoB, fromA)
         XCTAssertEqual(intoA, fromB)
+    }
+}
+
+/// Carries an error out of a closure running on another queue.
+private final class ErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Error?
+    var value: Error? {
+        get { lock.lock(); defer { lock.unlock() }; return storage }
+        set { lock.lock(); storage = newValue; lock.unlock() }
     }
 }
 
@@ -836,6 +883,29 @@ final class RDMAHardwareTests: XCTestCase {
             XCTAssertNoThrow(try verbs.deviceCount())
         } else {
             XCTAssertFalse(reason!.isEmpty)
+        }
+    }
+
+    /// Whichever way the shim was compiled, the reason it gives has to match it.
+    ///
+    /// Both branches are reachable here: an SDK without `<infiniband/verbs.h>`
+    /// takes the stub path, and so does `swift test -Xcc -DMCCL_RDMA_FORCE_STUB`
+    /// on a machine that has the header — which is how the CI path gets tested
+    /// on a developer machine that cannot otherwise reach it.
+    func testTheUnavailabilityReasonMatchesHowTheShimWasBuilt() {
+        let builtWithHeaders = mccl_rdma_built_with_headers() != 0
+        let unavailability = RDMATransport.unavailability()
+        if builtWithHeaders {
+            if case .notCompiled = unavailability {
+                XCTFail("built with the verbs header but reporting notCompiled")
+            }
+        } else {
+            guard case .notCompiled(let detail)? = unavailability else {
+                return XCTFail("built without the verbs header, so every path should "
+                               + "report notCompiled; got \(String(describing: unavailability))")
+            }
+            XCTAssertTrue(detail.contains("infiniband/verbs.h"), detail)
+            XCTAssertTrue(RDMATransport.deviceNames().isEmpty)
         }
     }
 

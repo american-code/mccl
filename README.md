@@ -44,18 +44,34 @@ has never been run on hardware. The same largely applies to C++ workloads on a
 uniform TB5 mesh: JACCL builds standalone and exposes a C++ API, so it is not
 MLX-only.
 
-**What mccl is for** is the rest of the space, which is most of it:
+**What mccl is for** is the rest of the space, which is most of it. Three claims
+survive scrutiny, in order of how much they matter:
 
-- **A C ABI.** `libmccl.dylib` behind `mccl.h`, in NCCL's idiom — llama.cpp, a
-  `ctypes` binding, any non-C++ runtime. JACCL's surface is C++.
-- **Mixed fabrics.** JACCL is RDMA-only and has no data path off the mesh. mccl
-  forms one world across a Thunderbolt island plus an Ethernet or Wi-Fi bridge
-  rank, each pair on the best cable the two share, islands detected from measured
-  bandwidth. That is the shape of a cluster built from machines you already owned,
-  and it is measured here on hardware.
-- **Compression where the fabric is slow** — which is exactly where RDMA is not
-  available. The two are complements, not competitors.
-- **A measured topology planner** in the library rather than a matrix handed to it.
+- **Mixed fabrics.** JACCL hard-requires RDMA over Thunderbolt 5 and has no data
+  path off the mesh — a node on Ethernet or Wi-Fi cannot join at all. mccl forms
+  one world across a Thunderbolt island plus an Ethernet or Wi-Fi bridge rank,
+  each pair on the best cable the two share, islands detected from measured
+  bandwidth and a hierarchical plan over the result. That is measured here on
+  hardware, and it is the shape of a cluster built from machines you already
+  owned.
+- **Compression where the fabric is slow.** Nothing in JACCL does in-band lossy
+  compression. mccl's crossover rule pays exactly where links are slow — which is
+  precisely where RDMA is unavailable. The two are complements, not competitors.
+- **Hardware older than Thunderbolt 5.** Enabling JACCL's fabric needs a TB5
+  controller and a Recovery-mode step, which locks out every M1- and M2-generation
+  Mac. That installed base is large, and mccl runs on it today.
+
+Two things are **not** differentiators, and it is worth saying so:
+
+- **A C ABI is parity, not a moat.** mccl's `libmccl.dylib`/`mccl.h` is genuinely
+  useful for runtimes that cannot link C++ — but JACCL builds standalone and
+  exposes a C++ API for any distributed workload, so "works outside MLX" is
+  something both do.
+- **Automatic topology choice is not unique either.** JACCL already picks mesh
+  versus ring by message size. mccl's planner claim is narrower and should be
+  stated that way: it works from *measured* per-link bandwidth and latency across
+  *mixed-speed* fabrics, with the tree/ring crossover solved rather than
+  thresholded — against JACCL's size-based selection on a uniform TB5 mesh.
 
 And mccl's RDMA transport speaks the same TN3205 verbs JACCL rides, so on the
 hardware where Apple's stack is right, mccl meets it rather than competing with

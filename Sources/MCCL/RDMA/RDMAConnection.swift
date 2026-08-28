@@ -377,7 +377,16 @@ final class RDMAConnection {
     }
 
     /// Announces a clean shutdown so the peer can tell close from cable-pull.
+    ///
+    /// Best-effort by construction, and it has to be. `sendSlot` blocks when
+    /// every send slot is in flight, and at teardown the usual reason for that
+    /// is the peer already being gone — so a blocking close would wait out the
+    /// whole operation timeout, once per channel, while `MeshFabric.shutdown`
+    /// walks the mesh. If there is no free slot the notification is simply
+    /// dropped: the peer still sees the bootstrap socket close, which is the
+    /// more dependable signal of the two anyway.
     func sendClose() {
+        guard !isClosed, sendsInFlight < geometry.slotCount else { return }
         try? sendSlot(payload: nil, byteCount: 0, closing: true)
     }
 

@@ -61,6 +61,28 @@ jobs:
           set -o pipefail
           swift test 2>&1 | tee test-output.txt
 
+      # The RDMA shim has two compilation paths, and which one this runner takes
+      # depends on whether its SDK has <infiniband/verbs.h> — macOS 26.2 or
+      # later. Both must work, so the one the runner did not take is built and
+      # tested explicitly rather than left to chance. On an older runner this
+      # re-runs the same path, which is cheap and harmless; on a newer one it is
+      # the only coverage the no-header path gets.
+      - name: Report which RDMA path this runner takes
+        run: |
+          SDK=$(xcrun --show-sdk-path)
+          echo "SDK: $SDK"
+          if [ -f "$SDK/usr/include/infiniband/verbs.h" ]; then
+            echo "verbs.h present — the default build uses the real header"
+          else
+            echo "verbs.h absent — the default build uses the stub path"
+          fi
+          ls -l "$SDK/usr/lib/librdma.tbd" 2>&1 || true
+
+      - name: Test the RDMA stub path (SDK without verbs.h)
+        run: |
+          set -o pipefail
+          swift test -Xcc -DMCCL_RDMA_FORCE_STUB 2>&1 | tail -20
+
       # The MLX tests are allowed to skip, but only for the one reason. A skip
       # that started happening for some other reason — or a suite that silently
       # stopped containing any tests — would otherwise look like a pass.

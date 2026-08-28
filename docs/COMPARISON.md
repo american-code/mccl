@@ -210,8 +210,26 @@ What can be compared is scope.
 | RDMA validated on hardware | yes, by Apple | **no** |
 
 **The row that matters most is the last one.** On a uniform TB5 mesh, JACCL is the
-better choice and this document should not pretend otherwise. The rows above it
-describe where mccl is not competing with JACCL at all: a C ABI for runtimes that
-cannot link C++, and fabrics that are not a uniform TB5 mesh — which is where the
-compression rule at the top of this document earns its keep, since a codec pays
-only on links slow enough that RDMA was never an option.
+better choice and this document should not pretend otherwise.
+
+Where mccl is not competing with JACCL at all is everything that is *not* a
+uniform TB5 mesh — and that is where the compression rule at the top of this
+document earns its keep, since a codec pays only on links slow enough that RDMA
+was never an option. Three claims survive scrutiny: mixed fabrics, which JACCL
+has no data path for; in-band lossy compression, which JACCL does not do; and
+hardware older than Thunderbolt 5, which JACCL's fabric excludes outright.
+
+Two claims do **not** survive, and are listed here so nobody has to discover them
+by checking. A C ABI is parity rather than a moat — JACCL builds standalone and
+exposes a C++ API for any distributed workload, so both libraries work outside
+MLX, and mccl's advantage is the C boundary specifically. And automatic algorithm
+choice is not unique: JACCL picks mesh versus ring by message size. mccl's
+planner claim narrows accordingly, to the "algorithm choice" and "topology" rows
+above — measured per-link data across mixed-speed fabrics with a solved
+crossover, not planning-versus-none.
+
+**On this repo's own hardware there is no head-to-head to run.** These are
+M1-generation machines with Thunderbolt 4: mccl works on them and JACCL cannot
+form a group at all. That is a difference in coverage, not in speed, and it is
+recorded here as one. The performance comparison needs TB5 on both sides and is
+step 7 of the checklist in [RDMA.md](RDMA.md#7-the-head-to-head-against-jaccl).

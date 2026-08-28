@@ -259,7 +259,10 @@ Being precise about this matters more than the feature.
   every `_Static_assert` cross-checking mccl's constants against Apple's enums
   passes.
 - The shim compiles against `MacOSX15.4.sdk`, which has **no** verbs header, as a
-  stub.
+  stub — and the whole suite passes on that path, exercised on a machine that
+  *does* have the header via `swift test -Xcc -DMCCL_RDMA_FORCE_STUB`. Without
+  that flag the no-header branch would only ever run on CI, where nobody watches
+  it; CI now builds both paths explicitly for the same reason.
 - The built binaries contain **zero** load-time references to librdma.
 
 **Verified at runtime, on an M1 with no Thunderbolt 5:**
@@ -361,25 +364,43 @@ mcclprobe measure <node1>:7777 <node2>:7777 --out topology-tb5.json
 
 Record the measured bandwidth and RTT per link, and the negotiated line rate.
 
+Rank 0 mints the token and the joiners are given it. **Keep every ssh session
+attached for the whole run** — a rank orphaned by an exiting ssh session fails its
+outbound dial with `EHOSTUNREACH` on macOS 26, for reasons that have nothing to do
+with RDMA and look exactly like a bug in mccl
+([USAGE.md](USAGE.md#launching-across-machines-keep-the-ssh-session-attached)).
+
 ```sh
-# rank 0
-mcclbench --distributed --rank 0 --world-size 4 --transport tcp \
-          --token-file /tmp/mccl.token --min-bytes 1024 --max-bytes 268435456 \
-          --csv tcp-tb5.csv --label tcp-tb5
-# ranks 1..3
-mcclbench --distributed --rank N --world-size 4 --transport tcp \
-          --token-file /tmp/mccl.token --min-bytes 1024 --max-bytes 268435456
+SWEEP="--world-size 4 --min-bytes 1024 --max-bytes 268435456"
+
+# rank 0 mints the token; --emit-token prints MCCL_TOKEN=<text> as its first line
+ssh node-0 "mcclbench --rank 0 $SWEEP --transport tcp --bind <node-0-tb-address> \
+            --emit-token --csv tcp-tb5.csv --label tcp-tb5" &
+# then, with that token, ranks 1..3
+ssh node-N "mcclbench --rank N $SWEEP --transport tcp --bind <node-N-tb-address> \
+            --token '<token>'" &
+wait
 ```
+
+`--bind` matters here: on a multi-homed machine it is what pins the rendezvous —
+and therefore the advertised address — to the Thunderbolt cable rather than to
+whatever Wi-Fi happens to answer first.
 
 ### 5. The RDMA sweep
 
 Identical, with one word changed:
 
 ```sh
-mcclbench --distributed --rank 0 --world-size 4 --transport rdma \
-          --token-file /tmp/mccl.token --min-bytes 1024 --max-bytes 268435456 \
-          --csv rdma-tb5.csv --label rdma-tb5
+ssh node-0 "mcclbench --rank 0 $SWEEP --transport rdma --bind <node-0-tb-address> \
+            --emit-token --csv rdma-tb5.csv --label rdma-tb5" &
+ssh node-N "mcclbench --rank N $SWEEP --transport rdma --bind <node-N-tb-address> \
+            --token '<token>'" &
+wait
 ```
+
+If a rank cannot use RDMA it says so and exits at argument-parse time rather than
+part way into bring-up, naming which of "no library", "no devices" or "not
+enabled" applies.
 
 Sweep the slot geometry too — 16 KiB, 64 KiB (default), 256 KiB, 1 MiB — since it
 was chosen from the spec rather than from measurement, and it is the single
@@ -422,7 +443,38 @@ ceiling. Both should be re-derived from the new measurements rather than adjuste
 by intuition. `mcclprobe plan topology-tb5.json --bytes N` replays the planner
 over the new topology and is the quickest way to see where it now switches.
 
-### 7. Correctness under load
+### 7. The head-to-head against JACCL
+
+This is the comparison every adopter will ask for, and it needs TB5 hardware on
+both sides, so it belongs here rather than in the repo's existing measurements.
+
+Run the same sweep — same message sizes, same collective, same dtype, same
+machines, same cables, same session — under JACCL and under mccl-over-RDMA:
+
+- **JACCL**: `mlx.distributed` with `backend="jaccl"`, or the standalone C++
+  `allreduce_bench` in `mlx/distributed/jaccl/lib/examples/`, which the MLX repo
+  describes as "similar in spirit to the NCCL all-reduce benchmark".
+- **mccl**: the `--transport rdma` sweep from step 5.
+
+Match the definitions before comparing the numbers: `mcclbench` reports
+algorithmic and bus bandwidth with the bus factor stated
+([COMPARISON.md](COMPARISON.md)), and a benchmark that divides by a different
+constant will disagree with it for reasons that have nothing to do with either
+implementation.
+
+Expect JACCL to win on a uniform TB5 mesh, and report it plainly if it does. It
+was co-developed with the hardware and has been run on it; mccl's transport, at
+the time you are reading this, has not. A result showing mccl ahead on that
+fabric is more likely to be a methodology error than a finding, and should be
+checked twice before it is published.
+
+**On the cluster this was written on, the comparison is not a benchmark at all.**
+These are M1-generation machines with Thunderbolt 4: mccl runs on them, and JACCL
+cannot form a group at all, because its fabric needs a TB5 controller. That is a
+works-versus-does-not-work difference in coverage, not a performance win, and it
+should never be reported as one.
+
+### 8. Correctness under load
 
 Run the existing distributed correctness path over RDMA, not just the benchmark:
 
@@ -454,15 +506,22 @@ transport is built to the same technote and has never been run. There is no
 version of this comparison in which mccl is the better choice for that case, and
 pretending otherwise would waste the reader's time.
 
-Some corrections to a framing that is easy to reach for and is wrong:
+Three corrections to a framing that is easy to reach for and is wrong:
 
 - **JACCL is not MLX-only.** It builds standalone from the MLX tree and exposes a
   C++ API; Apple's WWDC26 session 233 says explicitly that it "can be built
   without MLX" and "is not limited to machine learning". A C++ project on a
-  uniform TB5 mesh is well served by it.
+  uniform TB5 mesh is well served by it. So mccl's C ABI is a *parity* feature
+  here, useful for runtimes that cannot link C++ but not a moat — "works outside
+  MLX" describes both libraries.
 - **JACCL is not mesh-only.** The MLX docs describe fully-connected topologies,
   but the library also implements a ring mode (`prefer_ring`, `JACCL_RING`) for
   large messages.
+- **JACCL already chooses its own algorithm.** It selects between mesh and ring
+  by message size. mccl's planner is therefore not "planning versus none"; the
+  narrower and accurate claim is *measured* per-link bandwidth and latency across
+  *mixed-speed* fabrics with a solved crossover, against size-based selection on
+  a uniform mesh.
 
 With that said, the two do different jobs, and the differences are real:
 
@@ -470,8 +529,8 @@ With that said, the two do different jobs, and the differences are real:
 |---|---|---|
 | Fabric | RDMA over TB5 only; no TCP data path | TCP anywhere, RDMA where available, **mixed in one world** |
 | Hardware | Apple silicon with Thunderbolt 5, macOS 26.2+ | any Mac; RDMA is an optional accelerant |
-| Interface | C++ API | **C ABI** (`libmccl.dylib`), plus Swift |
-| Topology | validated against a matrix you supply; discovery is a separate ssh helper | measured in-process by `mcclprobe`, planned per operation |
+| Interface | C++ API, standalone-buildable | C ABI (`libmccl.dylib`), plus Swift — parity, not a moat |
+| Topology | validated against a matrix you supply; mesh/ring chosen by message size; discovery is a separate ssh helper | measured in-process by `mcclprobe`; mixed-speed fabrics; tree/ring crossover solved from bandwidth and latency |
 | Heterogeneous fabrics | not addressed | per-pair path selection, island detection, hierarchical plans |
 | Wire compression | none | int8 / downcast / top-k, with a measured crossover rule |
 | Collectives | `all_sum`, `all_max`, `all_min`, `all_gather`, `send`, `recv`, `barrier` | plus `broadcast`, `reduce`, `reduce_scatter` |
@@ -479,18 +538,20 @@ With that said, the two do different jobs, and the differences are real:
 
 **Where mccl stands alone**, and these are narrow but genuine:
 
-1. **A C ABI.** llama.cpp, a Python `ctypes` binding, a Rust or Go runtime, or
-   anything else that speaks C links `libmccl.dylib`. JACCL's surface is C++.
-2. **Mixed fabrics.** A Thunderbolt island plus an Ethernet or Wi-Fi bridge rank
-   is a world mccl forms, measures and plans over — every pair on the best cable
-   the two of them share. JACCL is RDMA-only and has no data path for a node that
-   is not on the mesh. This is the segment Apple's stack does not serve, and it is
-   the common shape of a cluster assembled from machines someone already owned.
-3. **Compression where the fabric is slow.** The crossover rule pays exactly where
-   links are slow — which is to say, precisely where RDMA is not available. The
-   two features are complements, not competitors.
-4. **A measured topology planner** inside the library rather than an out-of-band
-   configuration step.
+1. **Mixed fabrics — the one JACCL structurally cannot reach.** A Thunderbolt
+   island plus an Ethernet or Wi-Fi bridge rank is a world mccl forms, measures
+   and plans over, every pair on the best cable the two of them share. JACCL
+   hard-requires RDMA over TB5 and has no data path for a node that is not on the
+   mesh; there is no degrading onto Ethernet for one awkward rank. This is the
+   segment Apple's stack does not serve, and it is the common shape of a cluster
+   assembled from machines someone already owned.
+2. **Compression where the fabric is slow.** Nothing in JACCL does in-band lossy
+   compression. The crossover rule pays exactly where links are slow — which is to
+   say, precisely where RDMA is not available. The two are complements, not
+   competitors.
+3. **Hardware older than Thunderbolt 5.** The TB5 requirement, plus its
+   Recovery-mode enablement, excludes every M1- and M2-generation Mac. mccl runs
+   on all of them today — including the machines this was written on.
 
 And now a fifth thing that is not differentiation but the opposite: mccl speaks
 the same TN3205 verbs JACCL rides. On the hardware where Apple's stack is the

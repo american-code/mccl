@@ -14,7 +14,14 @@
 
 #include <string.h>
 
-#if __has_include(<infiniband/verbs.h>)
+/*
+ * `MCCL_RDMA_FORCE_STUB` compiles the no-header path on a machine that does
+ * have the header. Without it that path is reachable only on an SDK older than
+ * 26.2 — which is what CI runs on, and what nobody here can run the suite
+ * against. It exists so `swift test -Xcc -DMCCL_RDMA_FORCE_STUB` checks the
+ * branch CI will actually take.
+ */
+#if __has_include(<infiniband/verbs.h>) && !defined(MCCL_RDMA_FORCE_STUB)
 #define MCCL_HAVE_VERBS_HEADER 1
 #else
 #define MCCL_HAVE_VERBS_HEADER 0
