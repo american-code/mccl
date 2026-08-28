@@ -41,7 +41,8 @@ public enum BenchArguments {
       --codecs <list>        comma-separated: none,downcast,int8[:block],topk[:fraction]
       --dtype <name>         fp32 | fp16 | bf16 | i32 | i8 (default fp32)
       --op <name>            sum | prod | min | max | avg (default sum)
-      --transport <name>     tcp | loopback (default tcp)
+      --transport <name>     tcp | loopback | rdma (default tcp)
+                             rdma needs --distributed and Thunderbolt 5; see docs/RDMA.md
       --warmup <n>           untimed iterations per point (default 2)
       --min-iters <n>        floor on timed iterations (default 3)
       --max-iters <n>        ceiling on timed iterations (default 50)
@@ -245,9 +246,12 @@ public enum BenchArguments {
                                  + "creates its own (the rendezvous listener has to live in rank "
                                  + "0's process)")
             }
-            guard options.transport == .tcp else {
+            guard options.transport != .loopback else {
                 throw ParseError(message: "--transport loopback is in-process only; a distributed "
-                                 + "run always uses TCP")
+                                 + "run uses tcp or rdma")
+            }
+            if options.transport == .rdma, let reason = RDMATransport.unusableReason() {
+                throw ParseError(message: "--transport rdma is not usable here: \(reason)")
             }
             // The distributed world size is the one that counts; `--ranks` is
             // the in-process knob and would otherwise silently disagree.

@@ -233,7 +233,7 @@ final class BenchmarkTests: XCTestCase {
     func testBadArgumentsAreRejectedWithAReason() {
         for arguments in [["--ranks"], ["--ranks", "one"], ["--ranks", "1"],
                           ["--collective", "scatter"], ["--dtype", "fp8"],
-                          ["--op", "median"], ["--transport", "rdma"],
+                          ["--op", "median"], ["--transport", "infiniband"],
                           ["--algorithms", "mesh"], ["--min-bytes", "0"],
                           ["--min-bytes", "4096", "--max-bytes", "1024"],
                           ["--nonsense"]] {
@@ -241,6 +241,27 @@ final class BenchmarkTests: XCTestCase {
                                  "\(arguments) should not parse") { error in
                 XCTAssertFalse("\(error)".isEmpty, "an error needs to say what went wrong")
             }
+        }
+    }
+
+    /// `rdma` parses as a transport name. Whether it can be *used* is a separate
+    /// question the parser answers only for a distributed run, since an
+    /// in-process sweep never opens a queue pair.
+    func testRDMAIsAKnownTransportName() throws {
+        let options = try XCTUnwrap(BenchArguments.parse(["--transport", "rdma", "--ranks", "2"]))
+        XCTAssertEqual(options.transport, .rdma)
+    }
+
+    /// A distributed RDMA run on a machine without it must fail at parse time
+    /// with the reason, not deep inside bring-up.
+    func testDistributedRDMAReportsUnavailabilityEarly() throws {
+        guard let reason = RDMATransport.unusableReason() else {
+            throw XCTSkip("this machine has RDMA devices, so the rejection path cannot be taken")
+        }
+        XCTAssertThrowsError(try BenchArguments.parse(
+            ["--transport", "rdma", "--distributed", "--rank", "0", "--world-size", "2"])
+        ) { error in
+            XCTAssertTrue("\(error)".contains(reason.prefix(30)), "\(error)")
         }
     }
 

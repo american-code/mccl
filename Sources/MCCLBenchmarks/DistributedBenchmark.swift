@@ -116,8 +116,15 @@ public enum DistributedBenchRunner {
         let id = try obtainToken(distributed)
         onBringup?(Bringup(uniqueID: id, rank: distributed.rank, worldSize: distributed.worldSize))
 
+        // The rendezvous stays on TCP whatever the data transport is: rank 0's
+        // rendezvous listener is a plain socket, and an RDMA queue pair needs
+        // that socket to exchange its own metadata in the first place.
+        let dataTransport: Transport = options.transport == .rdma
+            ? try RDMATransport() : TCPTransport()
+
         let comm = try Communicator.join(
             uniqueID: id, rank: distributed.rank, worldSize: distributed.worldSize,
+            transport: dataTransport, rendezvousTransport: TCPTransport(),
             bindHost: distributed.bindHost ?? "0.0.0.0",
             advertisedHosts: distributed.advertisedHosts,
             timeout: distributed.timeout)

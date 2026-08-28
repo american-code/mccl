@@ -136,6 +136,9 @@ public enum BenchTransport: String, CaseIterable, Sendable {
     case tcp
     /// In-process byte queues. Isolates codec and kernel cost from the socket.
     case loopback
+    /// RDMA over Thunderbolt (TN3205). Distributed runs only, and only on a Mac
+    /// with Thunderbolt 5 and RDMA enabled — see docs/RDMA.md.
+    case rdma
 }
 
 // MARK: - Options

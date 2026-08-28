@@ -479,6 +479,7 @@ extension Communicator {
         rank: Int,
         worldSize: Int,
         transport: Transport = TCPTransport(),
+        rendezvousTransport: Transport? = nil,
         bindHost: String = "0.0.0.0",
         advertisedHosts: [String]? = nil,
         topology: Topology? = nil,
@@ -493,10 +494,17 @@ extension Communicator {
         // token's own host so an in-process transport binds where it expects to.
         let host = PeerAddress(host: id.address.host, port: 0).isLoopback ? id.address.host : bindHost
         let listener = try transport.listen(host: host, port: 0)
+        // The rendezvous is a control channel and need not be the data
+        // transport. They diverge for RDMA: rank 0's rendezvous listener is a
+        // plain socket, and TN3205 has queue-pair metadata travel over TCP
+        // anyway, so dialling rank 0 with a queue pair would be both wrong and
+        // circular. Defaults to `transport` so every existing caller is
+        // unaffected.
+        let control = rendezvousTransport ?? transport
         do {
             let advertisements = try Rendezvous.join(
                 id: id, rank: rank, worldSize: worldSize,
-                dataListener: listener, transport: transport,
+                dataListener: listener, transport: control,
                 advertisedHosts: advertisedHosts, timeout: timeout)
             guard advertisements.count == worldSize else {
                 throw MCCLError.protocolViolation(
